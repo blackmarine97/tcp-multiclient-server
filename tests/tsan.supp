@@ -1,0 +1,6 @@
+# GCC 11's libtsan has no interceptor for pthread_cond_clockwait, which libstdc++
+# uses for condition_variable::wait_until(steady_clock). TSan therefore never sees
+# the producer thread release producer_mtx_ while waiting, and reports the
+# (correct) lock in Server::stop() as a "double lock". Only that report is muted;
+# data-race reports are not affected. Not needed with GCC >= 12 or clang.
+mutex:radar::Server::stop

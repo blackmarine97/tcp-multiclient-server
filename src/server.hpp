@@ -1,0 +1,115 @@
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "config.hpp"
+#include "liveness.hpp"
+#include "slot.hpp"
+#include "socket_util.hpp"
+#include "track_frame.hpp"
+
+namespace radar {
+
+struct ServerStats {
+    std::uint64_t accepted = 0;
+    std::uint64_t rejected_full = 0;
+    std::uint64_t frames_produced = 0;
+    std::uint64_t frames_dropped = 0;        // queue overflow, summed over all clients
+    std::uint64_t stale_frames_skipped = 0;  // dequeued after STOP / slot reuse
+    std::uint64_t producer_overruns = 0;     // producer missed its 35 ms deadline
+    std::array<std::uint64_t, kCloseReasonCount> closed{};
+
+    std::uint64_t closed_by(CloseReason r) const { return closed[static_cast<std::size_t>(r)]; }
+};
+
+struct SlotSnapshot {
+    std::size_t index = 0;
+    SlotState state = SlotState::Free;
+    std::string peer;
+    std::uint16_t udp_port = 0;
+    std::uint64_t frames_sent = 0;
+    std::uint64_t fragments_sent = 0;
+    std::uint64_t frames_dropped = 0;
+    std::size_t queue_depth = 0;
+};
+
+// Multi-client track server.
+//
+// Threads (see docs/DESIGN.md):
+//   io        : poll() loop - accept, TCP commands, heartbeats, zombie sweep.
+//               The only thread that touches TCP sockets.
+//   producer  : every frame_interval builds one frame and pushes it to the
+//               bounded queue of every STREAMING slot (fan-out, shared_ptr).
+//   sender[i] : one per slot, pops its queue and sends UDP fragments.
+class Server {
+public:
+    explicit Server(Config cfg);
+    ~Server();
+    Server(const Server&) = delete;
+    Server& operator=(const Server&) = delete;
+
+    bool start(std::string* error);
+    void stop();  // graceful: sends "BYE SHUTDOWN", joins every thread. Idempotent.
+
+    std::uint16_t port() const { return bound_port_; }
+    std::size_t fragments_per_frame() const { return fragments_per_frame_; }
+    std::size_t active_clients() const { return active_.load(); }
+    std::vector<SlotSnapshot> snapshot() const;
+    ServerStats stats() const;
+
+private:
+    struct FrameItem {
+        std::shared_ptr<const PreparedFrame> frame;
+        std::uint64_t generation;  // slot generation at enqueue time
+    };
+    struct Slot;
+
+    void io_loop();
+    void producer_loop();
+    void sender_loop(std::size_t index);
+
+    void handle_accept(Clock::time_point now);
+    void handle_readable(std::size_t index, Clock::time_point now);
+    void handle_line(std::size_t index, const std::string& line);
+    void housekeeping(Clock::time_point now);
+    int poll_timeout_ms(Clock::time_point now) const;
+
+    bool queue_line(std::size_t index, const std::string& line);
+    bool flush(std::size_t index);
+    void close_slot(std::size_t index, CloseReason reason, const char* bye = nullptr);
+    std::string status_line(std::size_t index) const;
+    void wake();
+
+    Config cfg_;
+    std::uint16_t bound_port_ = 0;
+    std::size_t fragments_per_frame_ = 0;
+
+    UniqueFd listen_fd_;
+    UniqueFd wake_rd_, wake_wr_;
+    std::vector<std::unique_ptr<Slot>> slots_;
+    std::vector<UniqueFd> udp_fds_;  // one per sender thread
+
+    std::atomic<bool> running_{false};
+    std::atomic<bool> stop_{false};
+    std::mutex producer_mtx_;
+    std::condition_variable producer_cv_;
+
+    std::thread io_thread_;
+    std::thread producer_thread_;
+    std::vector<std::thread> sender_threads_;
+
+    std::atomic<std::size_t> active_{0};
+    std::atomic<std::uint64_t> accepted_{0}, rejected_full_{0}, frames_produced_{0}, frames_dropped_{0},
+        stale_skipped_{0}, producer_overruns_{0};
+    std::array<std::atomic<std::uint64_t>, kCloseReasonCount> closed_{};
+};
+
+}  // namespace radar

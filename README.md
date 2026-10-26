@@ -119,6 +119,27 @@ ctest -L integration                # 통합 테스트만
   frozen client reaped 399 ms after SIGSTOP
 ```
 
+### Python 스모크 테스트
+
+빌드된 실제 바이너리(`radar_server`, `radar_client`)를 실제 소켓으로 외부에서 검사한다. Python 3 표준 라이브러리만 사용.
+
+```bash
+python3 tests/smoke_test.py build
+```
+
+기본 명령 → 4번째 접속 거부 → 3개 동시 스트리밍(조각 수 = 서버 송신 수) → `radar_client` 프로세스 kill -9 후 슬롯 회수 →
+하트비트 무응답 좀비 정리(정상 클라이언트는 유지) → SIGINT 정상 종료 순으로 21개 항목을 확인하고, 모두 통과하면 종료 코드 0.
+
+```text
+3. 3 clients streaming
+  [PASS] client 0: received 172 fragments / 43 frames, server sent 172
+  ...
+5. zombie: client that never answers heartbeats
+  [PASS] zombie gets BYE TIMEOUT  (after 801 ms)
+...
+21/21 checks passed
+```
+
 ### ThreadSanitizer
 
 ```bash
@@ -145,6 +166,7 @@ src/
 tools/radar_client.cpp   데모/테스트 클라이언트
 tests/unit/              유닛 테스트
 tests/integration/       통합 테스트 (실제 소켓, 실제 자식 프로세스)
+tests/smoke_test.py      Python 스모크 테스트 (실제 바이너리를 외부에서 검사)
 config/server.conf       기본 설정
 scripts/demo.sh          E2E 데모
 docs/DESIGN.md           설계 문서

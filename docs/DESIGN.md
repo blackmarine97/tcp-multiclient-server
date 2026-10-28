@@ -17,7 +17,20 @@ SIGINT/SIGTERM 시 모든 클라이언트에 `BYE SHUTDOWN`을 보내고 정상 
 
 트레이드오프: Linux(WSL 포함) 전용이다(`accept4`, `pipe2`, `MSG_NOSIGNAL`). 이식이 필요하면 IO 스레드만 Asio로 교체하면 되도록 소켓 코드를 `Server`의 IO 스레드 함수에 모았다.
 
-## 3. 스레드 구조와 큐
+## 3. 스레드 구조와 큐 — Producer–Consumer 패턴
+
+트랙 데이터 경로는 **Producer–Consumer 패턴**으로 설계했다.
+
+| 패턴 요소 | 구현 | 코드 |
+|---|---|---|
+| Producer (생산자, 1개) | 35 ms마다 트랙 프레임을 만들어 큐에 넣는다 | `Server::producer_loop` (src/server.cpp) |
+| 버퍼 (크기 제한 큐, 클라이언트당 1개) | 용량 8, 꽉 차면 가장 오래된 것을 버리고 개수를 센다 | `BoundedQueue<T>` (src/bounded_queue.hpp) |
+| Consumer (소비자, 클라이언트당 1개) | 자기 큐에서 꺼내 UDP로 보낸다 | `Server::sender_loop` (src/server.cpp) |
+
+생산(프레임 생성 주기)과 소비(네트워크 전송 속도)를 큐로 분리해서, 한쪽이 느려도 다른 쪽이 기다리지 않는다.
+Producer는 큐가 꽉 차도 대기하지 않고(드롭 후 계속), Consumer는 큐가 비면 `condition_variable`로 잠든다(바쁜 대기 없음).
+종료 시에는 큐를 `close()`해서 잠든 Consumer를 깨워 끝낸다.
+버퍼를 하나만 두지 않고 클라이언트별로 두어 1 Producer : N Consumer 구조로 만든 이유는 아래 "설계 결정"에 있다.
 
 ```mermaid
 flowchart LR

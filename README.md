@@ -1,72 +1,73 @@
-# TCP 다중접속 서버 구현
+# TCP Multi-Client Server
 
-C++17 · POSIX 소켓 · Producer–Consumer · 하트비트/좀비 처리
+C++17 · POSIX sockets · Producer–Consumer · heartbeats and zombie handling
 
+A multi-client server that runs on a plain PC, without radar hardware. Up to 3 clients connect to a TCP
+command port, and each one receives fake radar track frames over UDP, generated every 35 ms. The server
+sends heartbeats, reaps dead (zombie) connections, and shuts down gracefully.
 
-레이더 하드웨어 없이 PC에서 동작하는 다중접속 서버. TCP 명령 포트에 최대 3개 클라이언트가 접속하고,
-각 클라이언트는 35 ms마다 생성되는 가짜 트랙 프레임을 UDP로 받는다. 하트비트·좀비 정리·정상 종료를 처리한다.
+- Design document: [docs/DESIGN.md](docs/DESIGN.md) (in Korean): thread structure and queues, slot state
+  diagram, zombie criteria and rationale, and why POSIX sockets were chosen
+- Sockets: POSIX sockets + `poll()` (rationale in DESIGN.md §2)
 
-- 설계 문서: [docs/DESIGN.md](docs/DESIGN.md) — 스레드 구조와 큐, 슬롯 상태도, 좀비 판정 기준과 근거, 소켓 API 선택 이유
-- 소켓: POSIX 소켓 + `poll()` (선택 이유는 설계 문서 §2)
+## Requirements
 
-## 요구 사항
-
-- Linux (Ubuntu 22.04에서 확인, Windows는 **WSL**로 빌드/실행)
+- Linux (tested on Ubuntu 22.04; on Windows, build and run inside **WSL**)
 - g++ ≥ 9 (C++17), CMake ≥ 3.16
-- GoogleTest: 시스템에 없으면 CMake가 v1.14.0을 자동 다운로드 (인터넷 필요)
+- GoogleTest: if it is not installed, CMake downloads v1.14.0 automatically (needs internet access)
 
 ```bash
 sudo apt install build-essential cmake
 ```
 
-## 빌드
+## Build
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ```
 
-결과물: `build/radar_server`, `build/radar_client`, `build/unit_tests`, `build/integration_tests`
+Outputs: `build/radar_server`, `build/radar_client`, `build/unit_tests`, `build/integration_tests`
 
-## 실행
+## Run
 
-### 서버
+### Server
 
 ```bash
 ./build/radar_server -c config/server.conf
 ```
 
-- `-c <file>`: 설정 파일 (없으면 기본값), `-p <port>`: 포트 덮어쓰기
-- Ctrl+C(SIGINT) / SIGTERM → 모든 클라이언트에 `BYE SHUTDOWN` 후 정상 종료
+- `-c <file>`: config file (defaults are used without one), `-p <port>`: override the port
+- Ctrl+C (SIGINT) or SIGTERM: sends `BYE SHUTDOWN` to every client, then exits cleanly
 
-설정 파일 [config/server.conf](config/server.conf):
+Config file [config/server.conf](config/server.conf):
 
-| 키 | 기본값 | 설명 |
+| Key | Default | Meaning |
 |---|---|---|
-| `tcp_port` | 8088 | 명령 포트 (0 = 임시 포트) |
-| `max_clients` | 3 | 최대 동시 접속 |
-| `frame_interval_ms` | 35 | 프레임 생성 주기 |
-| `heartbeat_interval_ms` | 1000 | `HB` 송신 주기 |
-| `zombie_timeout_ms` | 3500 | 이 시간 동안 수신이 없으면 좀비로 판정 |
-| `queue_capacity` | 8 | 클라이언트별 프레임 큐 크기 |
-| `queue_overflow` | drop_oldest | 큐가 가득 찼을 때: `drop_oldest` / `drop_newest` |
-| `tracks_per_frame` | 64 | 프레임당 트랙 수 |
-| `max_datagram_bytes` | 512 | UDP 조각 최대 크기 (64 트랙 → 4조각) |
-| `max_line_bytes` | 256 | 명령 한 줄 최대 길이 |
+| `tcp_port` | 8088 | Command port (0 = pick an ephemeral port) |
+| `max_clients` | 3 | Maximum concurrent clients |
+| `frame_interval_ms` | 35 | Frame generation period |
+| `heartbeat_interval_ms` | 1000 | How often the server sends `HB` |
+| `zombie_timeout_ms` | 3500 | A client that sends nothing for this long is a zombie |
+| `queue_capacity` | 8 | Per-client frame queue size |
+| `queue_overflow` | drop_oldest | When the queue is full: `drop_oldest` / `drop_newest` |
+| `tracks_per_frame` | 64 | Tracks per frame |
+| `max_datagram_bytes` | 512 | Maximum UDP fragment size (64 tracks → 4 fragments) |
+| `max_line_bytes` | 256 | Maximum length of one command line |
 | `log_level` | info | debug / info / warn / error / off |
 
-### 클라이언트
+### Client
 
-데모 클라이언트 (자동으로 REGISTER → START, 하트비트 응답, 수신 조각/프레임 집계):
+Demo client (automatically sends REGISTER and START, answers heartbeats, counts received fragments and frames):
 
 ```bash
 ./build/radar_client --port 8088
 ```
 
-옵션: `--host`, `--udp-port`, `--duration-ms N`(0 = 무한), `--no-pong`(좀비 흉내), `--no-start`, `--quiet`.
-만석이면 `REJECTED: server is full`을 출력하고 종료 코드 2로 끝난다.
+Options: `--host`, `--udp-port`, `--duration-ms N` (0 = run forever), `--no-pong` (behave like a zombie),
+`--no-start`, `--quiet`. If the server is full, it prints `REJECTED: server is full` and exits with code 2.
 
-`nc`로 직접 명령을 보낼 수도 있다:
+You can also type commands by hand with `nc`:
 
 ```text
 $ nc 127.0.0.1 8088
@@ -83,36 +84,54 @@ QUIT
 BYE
 ```
 
-명령: `REGISTER <udp_port>`, `START`, `STOP`, `PING [token]`, `PONG [seq]`, `STATUS`, `QUIT` (전체 프로토콜은 설계 문서 §6)
+### Commands
 
-### 데모 시나리오
+Each command is one line of text ending in `\n` (`\r\n` is accepted; keywords are case-insensitive).
 
-3개 접속 → 4번째 거부 → 1개 kill -9 → 새 클라이언트 입장 → 서버 SIGINT:
+| Command | Reply | Purpose |
+|---|---|---|
+| `REGISTER <udp_port>` | `OK REGISTERED udp=<ip>:<port>` | Where to send track data. The IP is always the address the TCP connection came from, so a client cannot aim the stream at a third party |
+| `START` | `OK STREAMING` / `ERR NOT_REGISTERED` | Start streaming (requires REGISTER) |
+| `STOP` | `OK STOPPED` / `ERR NOT_REGISTERED` | Pause streaming; no datagram is sent after this reply |
+| `PING [token]` | `PONG [token]` | Liveness/RTT check from the client side |
+| `PONG [seq]` | (none) | Answer to the server's `HB <seq>` heartbeat |
+| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= queue=` | Per-client state and counters |
+| `QUIT` | `BYE`, then the connection closes | Graceful disconnect |
+
+Errors: `ERR UNKNOWN_COMMAND <word>`, `ERR BAD_ARGUMENT <reason>` (connection stays open),
+`ERR LINE_TOO_LONG` (connection closed). Server-initiated lines: `WELCOME ...` on connect, `ERR FULL` when
+all slots are taken, `HB <seq>` every heartbeat, `BYE TIMEOUT` for a zombie, `BYE SHUTDOWN` on server exit.
+The full protocol is in DESIGN.md §6.
+
+### Demo scenario
+
+3 clients connect → a 4th is rejected → one is killed with kill -9 → a new client takes the freed slot →
+the server is stopped with SIGINT:
 
 ```bash
 bash scripts/demo.sh build
 ```
 
-## 테스트
+## Tests
 
 ```bash
 cd build
-ctest --output-on-failure          # 전체 (unit 43 + integration 14, 약 2초)
-ctest -L unit                       # 유닛 테스트만
-ctest -L integration                # 통합 테스트만
-./integration_tests --gtest_filter='*Kill*'   # 개별 실행 (측정값이 출력됨)
+ctest --output-on-failure          # everything (43 unit + 14 integration, about 2 s)
+ctest -L unit                       # unit tests only
+ctest -L integration                # integration tests only
+./integration_tests --gtest_filter='*Kill*'   # a single test (prints its measurements)
 ```
 
-과제 요구 테스트와의 대응:
+Required tests from the assignment:
 
-| 요구 | 테스트 |
+| Requirement | Tests |
 |---|---|
-| 좀비 판정 | `Liveness.*`, `ServerIT.FrozenClientIsReapedByHeartbeatTimeout` (SIGSTOP), `ServerIT.SilentClientIsZombieResponsiveClientIsNot` |
-| 4개 동시 접속 → 4번째 거부 | `ServerIT.FourthConcurrentClientGetsErrFullAndIsClosed`, `ServerIT.FourSimultaneousConnectsExactlyOneRejected` |
-| 3개 동시 스트리밍 → 클라이언트별 수신 조각 수 | `ServerIT.ThreeClientsStreamConcurrently` |
-| kill -9 → 슬롯 회수 | `ServerIT.KillDash9ClientReleasesSlotImmediately`, `ServerIT.KillDash9WhileFullLetsANewClientIn` |
+| Zombie detection | `Liveness.*`, `ServerIT.FrozenClientIsReapedByHeartbeatTimeout` (SIGSTOP), `ServerIT.SilentClientIsZombieResponsiveClientIsNot` |
+| 4 concurrent connections → 4th rejected | `ServerIT.FourthConcurrentClientGetsErrFullAndIsClosed`, `ServerIT.FourSimultaneousConnectsExactlyOneRejected` |
+| 3 concurrent streams → fragments received per client | `ServerIT.ThreeClientsStreamConcurrently` |
+| Client killed with kill -9 → slot reclaimed | `ServerIT.KillDash9ClientReleasesSlotImmediately`, `ServerIT.KillDash9WhileFullLetsANewClientIn` |
 
-실행 예 (`./integration_tests`의 출력 일부):
+Sample output from `./integration_tests`:
 
 ```text
   client 0: received fragments=168 frames=42 | server sent fragments=168
@@ -122,16 +141,19 @@ ctest -L integration                # 통합 테스트만
   frozen client reaped 399 ms after SIGSTOP
 ```
 
-### Python 스모크 테스트
+### Python smoke test
 
-빌드된 실제 바이너리(`radar_server`, `radar_client`)를 실제 소켓으로 외부에서 검사한다. Python 3 표준 라이브러리만 사용.
+Black-box test of the built binaries (`radar_server`, `radar_client`) over real sockets. Uses only the
+Python 3 standard library.
 
 ```bash
 python3 tests/smoke_test.py build
 ```
 
-기본 명령 → 4번째 접속 거부 → 3개 동시 스트리밍(조각 수 = 서버 송신 수) → `radar_client` 프로세스 kill -9 후 슬롯 회수 →
-하트비트 무응답 좀비 정리(정상 클라이언트는 유지) → SIGINT 정상 종료 순으로 21개 항목을 확인하고, 모두 통과하면 종료 코드 0.
+It checks 21 items in order: basic commands → 4th connection rejected → 3 concurrent streams (fragments
+received = fragments the server sent) → slot reclaimed after a `radar_client` process is killed with
+kill -9 → a client that ignores heartbeats is reaped while healthy clients stay → graceful shutdown on
+SIGINT. It exits with code 0 when everything passes.
 
 ```text
 3. 3 clients streaming
@@ -150,27 +172,28 @@ cmake -S . -B build-tsan -DRADAR_SANITIZER=thread -DCMAKE_BUILD_TYPE=Debug
 setarch $(uname -m) -R bash -c 'cmake --build build-tsan -j && cd build-tsan && ctest'
 ```
 
-`setarch -R`(ASLR 끄기)은 GCC 11 TSan이 최신 커널(WSL2 포함)에서 `unexpected memory mapping`으로 죽는 문제의 우회책이다.
-`tests/tsan.supp`는 GCC 11 libtsan의 알려진 오탐 1종만 억제한다(자세한 내용은 파일 주석).
+`setarch -R` (ASLR off) works around GCC 11's TSan aborting with `unexpected memory mapping` on recent
+kernels, including WSL2. `tests/tsan.supp` mutes one known GCC 11 libtsan false positive only; see the
+comment in that file.
 
-## 디렉터리 구조
+## Layout
 
 ```text
 src/
-  server.{hpp,cpp}       IO / Producer / Sender 스레드, 슬롯 관리
-  bounded_queue.hpp      크기 제한 큐 (drop_oldest / drop_newest, 드롭 집계)
-  liveness.hpp           좀비 판정 규칙
-  slot.hpp               슬롯 상태, 종료 사유
-  protocol.{hpp,cpp}     명령 파싱
-  line_buffer.{hpp,cpp}  TCP 스트림 → 줄 분리
-  track_frame.{hpp,cpp}  가짜 트랙 생성, 직렬화, UDP 조각화/재조립
-  config.{hpp,cpp}       설정 파일
+  server.{hpp,cpp}       IO / Producer / Sender threads, slot management
+  bounded_queue.hpp      bounded queue (drop_oldest / drop_newest, drop counting)
+  liveness.hpp           zombie rule
+  slot.hpp               slot states, close reasons
+  protocol.{hpp,cpp}     command parsing
+  line_buffer.{hpp,cpp}  TCP stream → lines
+  track_frame.{hpp,cpp}  fake tracks, serialization, UDP fragmentation/reassembly
+  config.{hpp,cpp}       config file
   main.cpp               radar_server
-tools/radar_client.cpp   데모/테스트 클라이언트
-tests/unit/              유닛 테스트
-tests/integration/       통합 테스트 (실제 소켓, 실제 자식 프로세스)
-tests/smoke_test.py      Python 스모크 테스트 (실제 바이너리를 외부에서 검사)
-config/server.conf       기본 설정
-scripts/demo.sh          E2E 데모
-docs/DESIGN.md           설계 문서
+tools/radar_client.cpp   demo / test client
+tests/unit/              unit tests
+tests/integration/       integration tests (real sockets, real child processes)
+tests/smoke_test.py      Python smoke test (black-box test of the built binaries)
+config/server.conf       default config
+scripts/demo.sh          end-to-end demo
+docs/DESIGN.md           design document (Korean)
 ```

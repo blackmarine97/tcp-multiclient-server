@@ -67,6 +67,21 @@ Demo client (automatically sends REGISTER and START, answers heartbeats, counts 
 Options: `--host`, `--udp-port`, `--duration-ms N` (0 = run forever), `--no-pong` (behave like a zombie),
 `--no-start`, `--quiet`. If the server is full, it prints `REJECTED: server is full` and exits with code 2.
 
+To keep the client running through failures, add `--reconnect`:
+
+```bash
+./build/radar_client --port 8088 --reconnect
+```
+
+It retries after a lost connection, a refused connection, `ERR FULL`, or a server that has gone silent (no
+heartbeat within the `timeout_ms` announced in `WELCOME`). Delays double from `--reconnect-min-ms` (default
+1000) up to `--reconnect-max-ms` (default 8000), plus up to 25% random jitter. Each new connection sends
+`REGISTER` and `START` again on the same UDP port, and the `SUMMARY` totals cover the whole run.
+`--max-retries N` gives up with exit code 3 after N consecutive failures (default 0 = never).
+
+Reconnecting is client-side only. The server treats a reconnect as a new client: the slot number may differ,
+its counters start from 0, and frames missed while disconnected are not resent.
+
 You can also type commands by hand with `nc`:
 
 ```text
@@ -116,7 +131,7 @@ bash scripts/demo.sh build
 
 ```bash
 cd build
-ctest --output-on-failure          # everything (43 unit + 14 integration, about 2 s)
+ctest --output-on-failure          # everything (47 unit + 23 integration)
 ctest -L unit                       # unit tests only
 ctest -L integration                # integration tests only
 ./integration_tests --gtest_filter='*Kill*'   # a single test (prints its measurements)
@@ -130,6 +145,10 @@ Required tests from the assignment:
 | 4 concurrent connections → 4th rejected | `ServerIT.FourthConcurrentClientGetsErrFullAndIsClosed`, `ServerIT.FourSimultaneousConnectsExactlyOneRejected` |
 | 3 concurrent streams → fragments received per client | `ServerIT.ThreeClientsStreamConcurrently` |
 | Client killed with kill -9 → slot reclaimed | `ServerIT.KillDash9ClientReleasesSlotImmediately`, `ServerIT.KillDash9WhileFullLetsANewClientIn` |
+
+Beyond the assignment, `ReconnectIT.*` covers `radar_client --reconnect`: coming back after being reaped as a
+zombie, retrying a full server, surviving a server restart, detecting a silent server, giving up, and Ctrl+C
+during a backoff.
 
 Sample output from `./integration_tests`:
 
@@ -183,6 +202,7 @@ src/
   server.{hpp,cpp}       IO / Producer / Sender threads, slot management
   bounded_queue.hpp      bounded queue (drop_oldest / drop_newest, drop counting)
   liveness.hpp           zombie rule
+  backoff.hpp            reconnect delay (used by radar_client)
   slot.hpp               slot states, close reasons
   protocol.{hpp,cpp}     command parsing
   line_buffer.{hpp,cpp}  TCP stream → lines

@@ -83,6 +83,12 @@ public:
     // Returns the complete serialized frame when `data` was its last missing fragment.
     std::optional<std::vector<std::uint8_t>> add(const std::uint8_t* data, std::size_t len);
 
+    // Gives up on every incomplete frame (counted as abandoned), e.g. after a reconnect.
+    void discard_pending() {
+        abandoned_ += pending_.size();
+        pending_.clear();
+    }
+
     std::uint64_t fragments() const { return fragments_; }
     std::uint64_t frames_completed() const { return completed_; }
     std::uint64_t frames_abandoned() const { return abandoned_; }

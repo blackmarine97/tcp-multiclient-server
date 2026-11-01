@@ -55,6 +55,7 @@ if(RADAR_BUILD_TESTS)
   include(GoogleTest)
 
   add_executable(unit_tests
+    tests/unit/test_backoff.cpp
     tests/unit/test_bounded_queue.cpp
     tests/unit/test_config.cpp
     tests/unit/test_line_buffer.cpp
@@ -70,7 +71,10 @@ if(RADAR_BUILD_TESTS)
 
   gtest_discover_tests(unit_tests PROPERTIES LABELS unit ENVIRONMENT "${RADAR_TEST_ENV}")
 
-  add_executable(integration_tests tests/integration/test_server.cpp)
+  add_executable(integration_tests
+    tests/integration/test_reconnect.cpp
+    tests/integration/test_server.cpp
+  )
   target_include_directories(integration_tests PRIVATE tests/support)
   target_link_libraries(integration_tests PRIVATE radar_core GTest::gtest_main)
   target_compile_definitions(integration_tests PRIVATE RADAR_CLIENT_PATH="$<TARGET_FILE:radar_client>")

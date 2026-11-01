@@ -187,6 +187,25 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 기본 64 트랙 = 1552 바이트 → 조각 4개/프레임. 수신 측 `FrameReassembler`가 순서 무관 재조립, 중복 무시, 오래된 미완성 프레임 폐기를 담당한다.
 기본값 512는 조각화 동작을 보여주기 위한 값이며, 실제 망에서는 IP 단편화를 피하는 ~1400이 적절하다.
 
+### 클라이언트 재연결 (`radar_client --reconnect`)
+
+과제 요구사항은 아니지만 추가한 기능이다. **서버는 바꾸지 않고 클라이언트에만** 구현했다. 서버에게 재접속은 새 클라이언트와 같다.
+
+| 항목 | 동작 | 근거 |
+|---|---|---|
+| 재시도 조건 | 연결 끊김, 접속 거부, `ERR FULL`, 서버 침묵 | Ctrl+C와 `--duration-ms` 만료는 사용자의 의도이므로 재시도하지 않는다 |
+| 서버 침묵 판정 | `WELCOME`의 `timeout_ms` 동안 TCP 수신이 없으면 끊긴 것으로 본다. `WELCOME` 자체가 5초 안에 안 오면 마찬가지 | 멈춘 서버나 망 단절은 TCP가 알려주지 않는다. 서버의 좀비 판정과 같은 문제를 반대 방향에서 푸는 것 |
+| 재시도 간격 | 1초부터 2배씩 늘려 최대 8초 + 무작위 0~25% | 죽은 서버를 쉴 새 없이 두드리지 않고, 함께 끊긴 클라이언트들이 동시에 몰리지 않게 한다 |
+| 간격 초기화 | `WELCOME`을 받으면 초기화 | TCP 연결만으로는 부족하다. 만석이면 연결된 뒤 `ERR FULL`을 받기 때문 |
+| 포기 | `--max-retries N`회 연속 실패 시 종료 코드 3 (기본은 무한 재시도) | |
+| UDP 소켓 | 재접속해도 유지 (포트 동일) | 재등록할 포트가 바뀌지 않는다 |
+| 미완성 프레임 | 재접속 때 버리고 `incomplete`로 집계 | 재시작한 서버는 프레임 번호를 다시 쓰므로, 옛 조각이 새 프레임에 섞이면 안 된다 |
+
+플래그 없이 실행하면 기존 동작 그대로다(`ERR FULL`이면 종료 코드 2, 연결이 끊기면 종료).
+
+세션 복원은 넣지 않았다. 재접속하면 슬롯 번호가 바뀔 수 있고 카운터는 0부터 시작하며, 끊긴 동안의 프레임은 다시 보내지 않는다.
+트랙은 최신 값만 의미가 있어 재전송할 이유가 없고, 슬롯을 예약해 두면 3개뿐인 슬롯이 부재중인 클라이언트에게 묶이기 때문이다.
+
 ## 7. 테스트 전략
 
 | 요구 테스트 | 테스트 | 방법 |
@@ -199,6 +218,7 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 | kill -9 → 슬롯 회수 | `ServerIT.KillDash9ClientReleasesSlotImmediately` | 실제 자식 프로세스 SIGKILL, zombie_timeout 30 s로 두어 **타이머가 아닌 EOF로** 회수됨을 증명 (~0 ms) |
 | | `ServerIT.KillDash9WhileFullLetsANewClientIn` | 만석 → kill -9 → 새 클라이언트 입장·수신 |
 | 정상 종료 | `QuitClosesGracefully`, `ServerShutdownSaysByeToEveryone` | `BYE` / `BYE SHUTDOWN` + EOF |
+| 재연결 (추가 기능) | `ReconnectBackoff.*` (unit), `ReconnectIT.*` | 좀비로 정리된 뒤 복귀, 만석 재시도, 서버 재시작, 서버 침묵 감지, 포기(종료 코드 3), 대기 중 Ctrl+C, 플래그 없을 때 기존 동작 유지 |
 | 큐 | `BoundedQueue.*` (unit) | drop_oldest/newest 동작과 집계, close 시 소비자 깨우기, 4 생산자 경쟁에서 `소비 + 드롭 == 생산` |
 
 모든 통합 테스트는 포트 0(임시 포트)을 써서 병렬 실행이 가능하고, 타이밍 의존 테스트는 짧은 하트비트(100~200 ms)로 빠르게 끝난다(전체 약 2 s).

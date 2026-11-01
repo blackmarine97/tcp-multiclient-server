@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, compiler: g++-9 }   # the oldest compiler the README promises
+          - { os: ubuntu-24.04, compiler: g++-13 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.compiler }} cmake
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          cmake --build build -j
+      - name: C++ tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Python smoke test
+        run: python3 tests/smoke_test.py build
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }} sanitizer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: ['thread', 'address,undefined']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        # setarch -R (ASLR off): GCC 11 sanitizers abort on recent kernels otherwise.
+        run: |
+          cmake -S . -B build-san -DRADAR_SANITIZER=${{ matrix.sanitizer }} -DCMAKE_BUILD_TYPE=Debug
+          setarch "$(uname -m)" -R bash -c 'cmake --build build-san -j && ctest --test-dir build-san --output-on-failure'

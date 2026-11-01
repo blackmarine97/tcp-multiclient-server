@@ -15,6 +15,8 @@ public:
     // Returns false once any line (complete or still pending) exceeds the limit.
     bool append(const char* data, std::size_t len);
 
+    // Next complete line. Stops for good at an overlong line: it and everything after
+    // it are never returned, while the lines before it still are.
     std::optional<std::string> next_line();
 
     void clear();

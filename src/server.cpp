@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <optional>
 
@@ -24,6 +25,12 @@ namespace {
 constexpr std::size_t kMaxOutbuf = 64 * 1024;  // unread replies before a client counts as stalled
 constexpr std::size_t kRecvChunk = 4096;
 constexpr int kListenBacklog = 16;
+
+// One thread serves every socket, so none of them may keep it busy: each poll() round
+// takes a bounded amount from each. poll() is level-triggered, so the rest is picked
+// up in the next round, after the other clients and the heartbeats had their turn.
+constexpr int kMaxAcceptsPerRound = 16;
+constexpr int kMaxReadsPerRound = 4;
 
 std::string errno_text(const char* what) { return std::string(what) + ": " + std::strerror(errno); }
 
@@ -59,9 +66,14 @@ struct Server::Slot {
     // ---- thread-safe ----
     BoundedQueue<FrameItem> queue;
     std::atomic<std::uint64_t> frames_sent{0}, fragments_sent{0}, frames_dropped{0}, send_errors{0};
+    std::atomic<std::size_t> pending_output{0};  // published copy of outbuf.size()
 };
 
-Server::Server(Config cfg) : cfg_(std::move(cfg)) {}
+Server::Server(Config cfg) : cfg_(std::move(cfg)) {
+    const auto target_us = std::chrono::duration_cast<std::chrono::microseconds>(cfg_.frame_interval).count();
+    period_total_ = IntervalStats(target_us);
+    period_window_ = IntervalStats(target_us);
+}
 
 Server::~Server() { stop(); }
 
@@ -159,6 +171,7 @@ void Server::wake() {
 void Server::io_loop() {
     std::vector<pollfd> pfds;
     std::vector<int> owner;  // -2 wake pipe, -1 listen socket, >= 0 slot index
+    next_stats_report_ = Clock::now() + cfg_.stats_interval;
 
     while (!stop_.load()) {
         pfds.clear();
@@ -215,6 +228,7 @@ void Server::io_loop() {
 
 int Server::poll_timeout_ms(Clock::time_point now) const {
     std::optional<Clock::time_point> next;
+    if (cfg_.stats_interval.count() > 0) next = next_stats_report_;
     for (const auto& sp : slots_) {
         if (sp->fd < 0) continue;
         const auto d = next_liveness_deadline(sp->last_rx, sp->last_hb, cfg_.heartbeat_interval,
@@ -228,7 +242,7 @@ int Server::poll_timeout_ms(Clock::time_point now) const {
 }
 
 void Server::handle_accept(Clock::time_point now) {
-    for (;;) {
+    for (int round = 0; round < kMaxAcceptsPerRound; ++round) {
         sockaddr_in peer{};
         socklen_t len = sizeof peer;
         const int fd = ::accept4(listen_fd_.get(), reinterpret_cast<sockaddr*>(&peer), &len,
@@ -290,18 +304,19 @@ void Server::handle_accept(Clock::time_point now) {
 void Server::handle_readable(std::size_t i, Clock::time_point now) {
     Slot& s = *slots_[i];
     char buf[kRecvChunk];
-    for (;;) {
+    for (int round = 0; round < kMaxReadsPerRound; ++round) {
         const ssize_t n = ::recv(s.fd, buf, sizeof buf, 0);
         if (n > 0) {
             s.last_rx = now;  // any byte proves the peer is alive
-            if (!s.inbuf.append(buf, static_cast<std::size_t>(n))) {
+            s.inbuf.append(buf, static_cast<std::size_t>(n));
+            while (auto line = s.inbuf.next_line()) {  // commands before a bad line are valid
+                handle_line(i, *line);
+                if (s.fd < 0) return;  // QUIT or a failed write closed the slot
+            }
+            if (s.inbuf.overflowed()) {
                 queue_line(i, "ERR LINE_TOO_LONG");
                 close_slot(i, CloseReason::Protocol);
                 return;
-            }
-            while (auto line = s.inbuf.next_line()) {
-                handle_line(i, *line);
-                if (s.fd < 0) return;  // QUIT or a failed write closed the slot
             }
             continue;
         }
@@ -384,6 +399,10 @@ void Server::handle_line(std::size_t i, const std::string& line) {
 }
 
 void Server::housekeeping(Clock::time_point now) {
+    if (cfg_.stats_interval.count() > 0 && now >= next_stats_report_) {
+        next_stats_report_ = now + cfg_.stats_interval;
+        log_stats_report();
+    }
     for (std::size_t i = 0; i < slots_.size(); ++i) {
         Slot& s = *slots_[i];
         if (s.fd < 0) continue;
@@ -414,7 +433,8 @@ std::string Server::status_line(std::size_t i) const {
            " frames_sent=" + std::to_string(s.frames_sent.load()) +
            " fragments_sent=" + std::to_string(s.fragments_sent.load()) +
            " dropped=" + std::to_string(s.frames_dropped.load()) +
-           " queue=" + std::to_string(s.queue.size()) + "/" + std::to_string(s.queue.capacity());
+           " send_errors=" + std::to_string(s.send_errors.load()) +
+           " queue=" +std::to_string(s.queue.size()) + "/" + std::to_string(s.queue.capacity());
 }
 
 bool Server::queue_line(std::size_t i, const std::string& line) {
@@ -444,9 +464,13 @@ bool Server::flush(std::size_t i) {
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;  // POLLOUT will resume
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {  // POLLOUT will resume
+            s.pending_output = s.outbuf.size();
+            return true;
+        }
         return false;
     }
+    s.pending_output = 0;
     return true;
 }
 
@@ -479,6 +503,7 @@ void Server::close_slot(std::size_t i, CloseReason reason, const char* bye) {
     s.fd = -1;
     s.inbuf.clear();
     s.outbuf.clear();
+    s.pending_output = 0;
 
     {
         std::lock_guard<std::mutex> lk(s.mtx);
@@ -499,10 +524,20 @@ void Server::producer_loop() {
     FakeTrackGenerator gen(cfg_.tracks_per_frame);
     const double dt = std::chrono::duration<double>(cfg_.frame_interval).count();
     auto next = Clock::now();
+    std::optional<Clock::time_point> last_tick;
 
     std::unique_lock<std::mutex> lk(producer_mtx_);
     while (!stop_.load()) {
         lk.unlock();
+        const auto tick = Clock::now();
+        if (last_tick) {
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(tick - *last_tick).count();
+            std::lock_guard<std::mutex> plk(period_mtx_);
+            period_total_.add(us);
+            period_window_.add(us);
+        }
+        last_tick = tick;
+
         const auto ts = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
@@ -588,7 +623,9 @@ std::vector<SlotSnapshot> Server::snapshot() const {
         snap.frames_sent = s.frames_sent.load();
         snap.fragments_sent = s.fragments_sent.load();
         snap.frames_dropped = s.frames_dropped.load();
+        snap.send_errors = s.send_errors.load();
         snap.queue_depth = s.queue.size();
+        snap.pending_output_bytes = s.pending_output.load();
         out.push_back(std::move(snap));
     }
     return out;
@@ -603,7 +640,48 @@ ServerStats Server::stats() const {
     st.stale_frames_skipped = stale_skipped_.load();
     st.producer_overruns = producer_overruns_.load();
     for (std::size_t r = 0; r < kCloseReasonCount; ++r) st.closed[r] = closed_[r].load();
+    std::lock_guard<std::mutex> lk(period_mtx_);
+    st.frame_period = period_total_;
     return st;
+}
+
+void Server::log_stats_report() {
+    IntervalStats window;
+    {
+        std::lock_guard<std::mutex> lk(period_mtx_);
+        window = period_window_;
+        period_window_.reset();
+    }
+    if (!log_enabled(LogLevel::Info)) return;
+    for (const auto& line : format_stats_report(stats(), snapshot(), window)) log_msg(LogLevel::Info, line);
+}
+
+std::vector<std::string> format_stats_report(const ServerStats& stats, const std::vector<SlotSnapshot>& slots,
+                                             const IntervalStats& window) {
+    std::size_t in_use = 0;
+    for (const auto& s : slots) in_use += s.state != SlotState::Free;
+
+    char period[128];
+    std::snprintf(period, sizeof period, "period_ms avg=%.2f min=%.2f max=%.2f jitter=%.2f", window.mean_us() / 1000.0,
+                  static_cast<double>(window.min_us()) / 1000.0, static_cast<double>(window.max_us()) / 1000.0,
+                  window.jitter_us() / 1000.0);
+
+    std::vector<std::string> lines;
+    lines.push_back("stats: clients=" + std::to_string(in_use) + "/" + std::to_string(slots.size()) +
+                    " produced=" + std::to_string(stats.frames_produced) +
+                    " dropped=" + std::to_string(stats.frames_dropped) +
+                    " rejected_full=" + std::to_string(stats.rejected_full) +
+                    " overruns=" + std::to_string(stats.producer_overruns) + " " + period);
+    for (const auto& s : slots) {
+        if (s.state == SlotState::Free) continue;
+        lines.push_back("stats: slot " + std::to_string(s.index) + " " + to_string(s.state) + " peer=" + s.peer +
+                        " udp_port=" + std::to_string(s.udp_port) + " frames_sent=" + std::to_string(s.frames_sent) +
+                        " fragments_sent=" + std::to_string(s.fragments_sent) +
+                        " dropped=" + std::to_string(s.frames_dropped) + " send_errors=" + std::to_string(s.send_errors) +
+                        " queue=" + std::to_string(s.queue_depth) +
+                        " pending_output=" + std::to_string(s.pending_output_bytes));
+    }
+    return lines;
 }
 
 }  // namespace radar

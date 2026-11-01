@@ -20,6 +20,7 @@ struct Config {
     std::chrono::milliseconds frame_interval{35};
     std::chrono::milliseconds heartbeat_interval{1000};
     std::chrono::milliseconds zombie_timeout{3500};
+    std::chrono::milliseconds stats_interval{5000};  // periodic stats log; 0 = off
 
     std::size_t queue_capacity = 8;  // frames per client
     OverflowPolicy queue_overflow = OverflowPolicy::DropOldest;

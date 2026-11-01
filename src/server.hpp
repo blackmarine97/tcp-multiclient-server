@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "config.hpp"
+#include "interval_stats.hpp"
 #include "liveness.hpp"
 #include "slot.hpp"
 #include "socket_util.hpp"
@@ -26,6 +27,7 @@ struct ServerStats {
     std::uint64_t stale_frames_skipped = 0;  // dequeued after STOP / slot reuse
     std::uint64_t producer_overruns = 0;     // producer missed its 35 ms deadline
     std::array<std::uint64_t, kCloseReasonCount> closed{};
+    IntervalStats frame_period;  // measured time between frames, since start
 
     std::uint64_t closed_by(CloseReason r) const { return closed[static_cast<std::size_t>(r)]; }
 };
@@ -38,8 +40,15 @@ struct SlotSnapshot {
     std::uint64_t frames_sent = 0;
     std::uint64_t fragments_sent = 0;
     std::uint64_t frames_dropped = 0;
+    std::uint64_t send_errors = 0;
     std::size_t queue_depth = 0;
+    std::size_t pending_output_bytes = 0;  // TCP replies the client has not taken yet
 };
+
+// The periodic stats log as text: one line for the server, one per occupied slot.
+// `window` is the frame period measured since the previous report.
+std::vector<std::string> format_stats_report(const ServerStats& stats, const std::vector<SlotSnapshot>& slots,
+                                             const IntervalStats& window);
 
 // Multi-client track server.
 //
@@ -85,6 +94,7 @@ private:
     void handle_readable(std::size_t index, Clock::time_point now);
     void handle_line(std::size_t index, const std::string& line);
     void housekeeping(Clock::time_point now);
+    void log_stats_report();
     int poll_timeout_ms(Clock::time_point now) const;
 
     bool queue_line(std::size_t index, const std::string& line);
@@ -115,6 +125,11 @@ private:
     std::atomic<std::uint64_t> accepted_{0}, rejected_full_{0}, frames_produced_{0}, frames_dropped_{0},
         stale_skipped_{0}, producer_overruns_{0};
     std::array<std::atomic<std::uint64_t>, kCloseReasonCount> closed_{};
+
+    mutable std::mutex period_mtx_;
+    IntervalStats period_total_, period_window_;
+
+    Clock::time_point next_stats_report_{};  // io thread only
 };
 
 }  // namespace radar

@@ -80,6 +80,9 @@ std::optional<Config> parse_config(std::istream& in, std::string* error) {
         } else if (key == "zombie_timeout_ms") {
             if (!need_uint(20, 3600000)) return fail(range_msg(20, 3600000));
             cfg.zombie_timeout = std::chrono::milliseconds(n);
+        } else if (key == "stats_interval_ms") {
+            if (!need_uint(0, 3600000)) return fail(range_msg(0, 3600000));
+            cfg.stats_interval = std::chrono::milliseconds(n);
         } else if (key == "queue_capacity") {
             if (!need_uint(1, 4096)) return fail(range_msg(1, 4096));
             cfg.queue_capacity = n;

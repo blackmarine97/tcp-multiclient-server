@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "line_buffer.hpp"
+#include "stream_stats.hpp"
 #include "track_frame.hpp"
 
 namespace radar::test {
@@ -28,13 +29,15 @@ using SteadyClock = std::chrono::steady_clock;
 
 class TestClient {
 public:
-    TestClient() : in_(4096) {}
+    TestClient() : in_(1 << 20) {}
     ~TestClient() { close(); }
     TestClient(const TestClient&) = delete;
     TestClient& operator=(const TestClient&) = delete;
 
-    bool connect(std::uint16_t port) {
+    // rcvbuf > 0 shrinks the receive buffer (must be set before connecting).
+    bool connect(std::uint16_t port, int rcvbuf = 0) {
         tcp_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (rcvbuf > 0) ::setsockopt(tcp_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_port = htons(port);
@@ -55,8 +58,9 @@ public:
         return ntohs(a.sin_port);
     }
 
-    bool send_line(const std::string& line) {
-        const std::string d = line + "\n";
+    bool send_line(const std::string& line) { return send_raw(line + "\n"); }
+
+    bool send_raw(const std::string& d) {
         std::size_t off = 0;
         while (off < d.size()) {
             const ssize_t n = ::send(tcp_, d.data() + off, d.size() - off, MSG_NOSIGNAL);
@@ -107,8 +111,10 @@ public:
     }
 
     const FrameReassembler& udp_stats() const { return reasm_; }
+    const StreamStats& stream_stats() const { return stream_; }
     std::uint64_t heartbeats() const { return heartbeats_; }
     bool eof() const { return eof_; }
+    int tcp_fd() const { return tcp_; }
     bool auto_pong = true;
 
 private:
@@ -156,7 +162,13 @@ private:
         for (;;) {
             const ssize_t n = ::recv(udp_, buf, sizeof buf, 0);
             if (n < 0) return;
-            reasm_.add(buf, static_cast<std::size_t>(n));
+            const auto payload = reasm_.add(buf, static_cast<std::size_t>(n));
+            if (!payload) continue;
+            const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+            if (const auto frame = deserialize_frame(payload->data(), payload->size()))
+                stream_.on_frame(frame->seq, frame->timestamp_us, static_cast<std::uint64_t>(now_us));
         }
     }
 
@@ -164,6 +176,7 @@ private:
     LineBuffer in_;
     std::deque<std::string> lines_;
     FrameReassembler reasm_{64};
+    StreamStats stream_;
     std::uint64_t heartbeats_ = 0;
     bool eof_ = false;
 };

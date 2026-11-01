@@ -69,6 +69,9 @@ flowchart LR
   큐를 하나만 두고 Sender가 모두에게 보내면, 한 클라이언트의 송신 지연이 전체를 지연시킨다.
 - **Zero-copy fan-out.** 프레임은 Producer에서 한 번만 직렬화·조각화되고 `shared_ptr<const PreparedFrame>`로 모든 큐에 공유된다. 불변 객체이므로 읽기에 락이 필요 없다.
 - **Producer는 절대 블로킹하지 않는다.** 레이더 주기(35 ms)는 실시간 제약이므로 소비자가 느리다고 생산을 멈추면 안 된다.
+- **IO 스레드는 한 소켓에 오래 머물지 않는다.** 스레드 하나가 모든 소켓을 처리하므로, `poll()` 한 라운드에 소켓당 읽기 4회(16 KB), accept 16회까지만 처리한다.
+  `poll()`은 level-triggered라 남은 데이터는 다음 라운드에 다시 잡힌다.
+  (초기 구현은 소켓을 비울 때까지 읽어서, 명령을 쉬지 않고 보내는 클라이언트 하나가 다른 클라이언트의 응답과 하트비트를 3초 이상 완전히 막았다. `FloodingClientDoesNotStarveOtherClients` 테스트로 발견했고, 수정 후 최악 응답은 45 ms다.)
 
 ### 큐 정책 (크기 제한 · 가득 찼을 때 · 버린 개수)
 
@@ -93,7 +96,7 @@ flowchart LR
 - 락 순서: `send_mtx` → `mtx` (Sender), `mtx` → 큐 mutex (Producer). Sender는 pop을 락 없이 끝낸 뒤 `send_mtx`를 잡고, IO 스레드는 `mtx`를 놓은 뒤 `send_mtx`를 거치므로 순서가 뒤집히지 않아 교착이 없다.
 - 시그널: 모든 스레드에서 SIGINT/SIGTERM을 block하고 main이 `sigwait()`으로 받는다. 비동기 시그널 핸들러 안에서 하는 일이 없다.
   `SIGPIPE`는 무시 + `MSG_NOSIGNAL`.
-- ThreadSanitizer 빌드(`-DRADAR_SANITIZER=thread`)로 전체 테스트 실행 시 data race 보고 0건.
+- ThreadSanitizer 빌드(`-DRADAR_SANITIZER=thread`)와 ASan+UBSan 빌드(`-DRADAR_SANITIZER=address,undefined`)로 전체 테스트 실행 시 보고 0건.
 
 ## 4. 슬롯 수명주기 상태도
 
@@ -173,7 +176,7 @@ kill -9는 흔히 "좀비"로 생각되지만, 실제로는 커널이 FIN을 보
 | `STOP` | `OK STOPPED` / `ERR NOT_REGISTERED` | |
 | `PING [token]` | `PONG [token]` | 클라이언트 측 RTT 확인용 |
 | `PONG [seq]` | (없음) | 서버 `HB <seq>`에 대한 응답 |
-| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= queue=a/b` | |
+| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= send_errors= queue=a/b` | |
 | `QUIT` | `BYE` 후 종료 | |
 | 그 외 | `ERR UNKNOWN_COMMAND <kw>` / `ERR BAD_ARGUMENT <msg>` | 연결 유지 |
 | 256 바이트 초과 줄 | `ERR LINE_TOO_LONG` 후 종료 | 메모리 고갈 방지 |
@@ -208,6 +211,14 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 세션 복원은 넣지 않았다. 재접속하면 슬롯 번호가 바뀔 수 있고 카운터는 0부터 시작하며, 끊긴 동안의 프레임은 다시 보내지 않는다.
 트랙은 최신 값만 의미가 있어 재전송할 이유가 없고, 슬롯을 예약해 두면 3개뿐인 슬롯이 부재중인 클라이언트에게 묶이기 때문이다.
 
+### 측정 (과제 외 추가 기능)
+
+| 항목 | 위치 | 내용 |
+|---|---|---|
+| 프레임 주기 | 서버 (`IntervalStats`) | Producer가 프레임 사이 실제 간격을 재서 평균·최소·최대·지터(35 ms와의 평균 차이)를 집계. 고정 주기 스케줄이라 한 번 늦어도 뒤로 밀리지 않는다 |
+| 주기 통계 로그 | 서버 (`stats_interval_ms`, 기본 5초) | IO 스레드가 서버 전체 한 줄과 사용 중인 슬롯당 한 줄을 기록. 별도 스레드 없이 `poll()` 마감 시각에 포함 |
+| 손실·지연 | 클라이언트 (`StreamStats`) | 재조립된 프레임의 번호 공백을 손실로 집계(UDP 손실, 미완성 프레임, 서버 드롭 모두 포함). 재접속 뒤에는 기준을 새로 잡아 끊긴 동안은 손실로 세지 않는다. 지연은 서버와 클라이언트 시계를 비교하므로 시계가 맞는 환경에서만 의미가 있다 |
+
 ## 7. 테스트 전략
 
 | 요구 테스트 | 테스트 | 방법 |
@@ -226,12 +237,20 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 | 클라이언트 격리 | `ServerIT.StuckConsumerDoesNotAffectOtherClients` | 한 슬롯의 Sender가 멈춰도 다른 클라이언트는 드롭 없이 거의 모든 프레임을 받음 |
 | 긴 프레임 중 STOP | `ServerIT.StopTakesEffectInTheMiddleOfALongFrame` | `OK STOPPED` 이후 조각이 더 나가지 않음 |
 | 읽지 않는 클라이언트 | `ServerIT.ClientThatStopsReadingIsReapedAsStalled` | 보내기만 하고 읽지 않아 타이머로는 못 잡는 클라이언트를 출력 버퍼 초과로 정리, 다른 클라이언트는 영향 없음 |
+| 프레임 주기 | `ServerIT.FramePeriodIsCloseToConfigured` | 측정한 평균 주기가 35 ms ± 1.5 ms. 개별 간격은 OS 스케줄러에 달려 있어 출력만 하고 판정하지 않는다 |
+| 접속 반복 | `RobustnessIT.ConnectionChurnLeavesNothingBehind`, `RepeatedKillDash9LeavesNothingBehind` | 스레드 4개로 4000회 접속(정상 종료, FIN, RST, 스트리밍 중 단절). 이후 fd 수 동일, 슬롯 전부 FREE, 접속 수 = 종료 수 |
+| 슬롯 재사용 | `RobustnessIT.ReusedSlotStartsCleanAndOldClientGetsNothingMore`, `FramesQueuedForTheOldClientNeverReachTheNewOne` | 세대 번호 검증: 이전 클라이언트의 프레임과 카운터가 새 클라이언트에게 넘어가지 않음 |
+| 부분 전송 | `RobustnessIT.RepliesSurviveAClientThatPausesReading` | 읽기를 멈췄다 재개한 클라이언트가 응답을 빠짐없이 순서대로 받음 (`POLLOUT` 경로) |
+| 공정성 | `RobustnessIT.FloodOfRejectedConnections*`, `FloodingClientDoesNotStarveOtherClients` | 접속 폭주나 명령 폭주 중에도 다른 클라이언트의 최악 응답 200 ms 미만, 하트비트 유지 |
+| 종료 | `RobustnessIT.StopUnderLoadNeverHangs` | 스트리밍 중, 긴 프레임 전송 중 `stop()` 12회 반복. 2초 안에 끝나고 모두 `BYE SHUTDOWN` 수신 |
+| 경쟁·입력·경로·설정 | `RobustnessIT.*` | 클라이언트 10개가 슬롯 3개 경쟁, 1바이트씩 전송, 한 패킷에 여러 명령, `QUIT` 뒤 명령, 바이너리 입력, 줄 길이 경계, 듣지 않는 UDP 포트, 스트리밍 중 포트 변경, 사용 중인 포트, `max_clients=64` |
 
 모든 통합 테스트는 포트 0(임시 포트)을 써서 병렬 실행이 가능하고, 타이밍 의존 테스트는 짧은 하트비트(100~200 ms)로 빠르게 끝난다(전체 약 2 s).
 
 ## 8. 한계와 개선 여지
 
 - Linux 전용(POSIX). Windows 지원은 IO 스레드를 Asio로 바꾸거나 Winsock 분기 필요.
+- 어떤 바이트든 받으면 살아 있다고 보므로, 줄을 끝내지 않고 가끔 1바이트씩만 보내는 클라이언트(슬로우 로리스)는 줄 길이 제한에 걸릴 때까지 슬롯을 차지한다(기본값으로 3.5초마다 1바이트면 약 15분).
 - 접속 수가 커지면 `poll()` → `epoll`로, 슬롯당 Sender 스레드 → 고정 크기 Sender 풀로 바꾸는 것이 맞다.
 - 인증/암호화 없음. UDP 목적지는 TCP 접속 IP로 고정해 반사 공격만 막았다.
 - 테스트 환경 참고: GCC 11 TSan은 최신 WSL 커널에서 `setarch -R`이 필요하고, `pthread_cond_clockwait` 미지원으로 생기는 오탐 1종을 `tests/tsan.supp`에서 억제한다(data race 억제 아님).

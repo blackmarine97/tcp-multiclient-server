@@ -13,11 +13,12 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(RADAR_BUILD_TESTS "Build unit and integration tests" ON)
-set(RADAR_SANITIZER "" CACHE STRING "Optional sanitizer: thread | address")
+set(RADAR_SANITIZER "" CACHE STRING "Optional sanitizers: thread | address,undefined")
 
 if(RADAR_SANITIZER)
-  add_compile_options(-fsanitize=${RADAR_SANITIZER} -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=${RADAR_SANITIZER})
+  # no-recover: an undefined-behaviour report fails the test instead of only being printed
+  add_compile_options(-fsanitize=${RADAR_SANITIZER} -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=${RADAR_SANITIZER} -fno-sanitize-recover=undefined)
 endif()
 
 find_package(Threads REQUIRED)
@@ -61,6 +62,7 @@ if(RADAR_BUILD_TESTS)
     tests/unit/test_line_buffer.cpp
     tests/unit/test_liveness.cpp
     tests/unit/test_protocol.cpp
+    tests/unit/test_stats.cpp
     tests/unit/test_track_frame.cpp
   )
   target_link_libraries(unit_tests PRIVATE radar_core GTest::gtest_main)
@@ -73,6 +75,7 @@ if(RADAR_BUILD_TESTS)
 
   add_executable(integration_tests
     tests/integration/test_reconnect.cpp
+    tests/integration/test_robustness.cpp
     tests/integration/test_server.cpp
   )
   target_include_directories(integration_tests PRIVATE tests/support)

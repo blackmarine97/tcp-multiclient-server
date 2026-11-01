@@ -54,6 +54,7 @@ Config file [config/server.conf](config/server.conf):
 | `tracks_per_frame` | 64 | Tracks per frame |
 | `max_datagram_bytes` | 512 | Maximum UDP fragment size (64 tracks → 4 fragments) |
 | `max_line_bytes` | 256 | Maximum length of one command line |
+| `stats_interval_ms` | 5000 | Periodic stats log (needs `log_level = info`); 0 = off |
 | `log_level` | info | debug / info / warn / error / off |
 
 ### Client
@@ -89,7 +90,7 @@ OK STREAMING
 HB 1
 PONG 1
 STATUS
-OK STATUS slot=0 state=STREAMING udp_port=5000 frames_sent=61 fragments_sent=244 dropped=0 queue=0/8
+OK STATUS slot=0 state=STREAMING udp_port=5000 frames_sent=61 fragments_sent=244 dropped=0 send_errors=0 queue=0/8
 QUIT
 BYE
 ```
@@ -105,13 +106,32 @@ Each command is one line of text ending in `\n` (`\r\n` is accepted; keywords ar
 | `STOP` | `OK STOPPED` / `ERR NOT_REGISTERED` | Pause streaming; no datagram is sent after this reply |
 | `PING [token]` | `PONG [token]` | Liveness/RTT check from the client side |
 | `PONG [seq]` | (none) | Answer to the server's `HB <seq>` heartbeat |
-| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= queue=` | Per-client state and counters |
+| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= send_errors= queue=` | Per-client state and counters |
 | `QUIT` | `BYE`, then the connection closes | Graceful disconnect |
 
 Errors: `ERR UNKNOWN_COMMAND <word>`, `ERR BAD_ARGUMENT <reason>` (connection stays open),
 `ERR LINE_TOO_LONG` (connection closed). Server-initiated lines: `WELCOME ...` on connect, `ERR FULL` when
 all slots are taken, `HB <seq>` every heartbeat, `BYE TIMEOUT` for a zombie, `BYE SHUTDOWN` on server exit.
 The full protocol is in DESIGN.md §6.
+
+### Measurements
+
+The server logs a report every `stats_interval_ms`, including the measured frame period:
+
+```text
+stats: clients=1/3 produced=58 dropped=0 rejected_full=0 overruns=0 period_ms avg=35.00 min=34.85 max=35.13 jitter=0.03
+stats: slot 0 STREAMING peer=127.0.0.1:34142 udp_port=49649 frames_sent=52 fragments_sent=208 dropped=0 send_errors=0 queue=0 pending_output=0
+```
+
+The client reports loss and latency in its `STATS` and `SUMMARY` lines:
+
+```text
+SUMMARY fragments=292 frames=73 incomplete=0 invalid=0 heartbeats=2 sessions=1 rejected_full=0 lost=0 loss_pct=0.00 latency_ms_avg=0.10 latency_ms_max=0.17
+```
+
+`lost` counts gaps in the frame numbers within a connection, whatever the cause: UDP loss, an incomplete frame, or
+a frame the server dropped from a full queue. Latency compares the server's clock with the client's, so it is only
+meaningful on one machine or with synchronized clocks.
 
 ### Demo scenario
 
@@ -126,7 +146,7 @@ bash scripts/demo.sh build
 
 ```bash
 cd build
-ctest --output-on-failure          # everything (47 unit + 28 integration)
+ctest --output-on-failure          # everything (59 unit + 50 integration)
 ctest -L unit                       # unit tests only
 ctest -L integration                # integration tests only
 ./integration_tests --gtest_filter='*Kill*'   # a single test (prints its measurements)
@@ -149,6 +169,10 @@ Beyond the assignment:
   (both overflow policies), and other clients lose nothing.
 - `ServerIT.ClientThatStopsReadingIsReapedAsStalled`: a client that sends but never reads, caught by the output
   backlog limit rather than the heartbeat timer.
+- `ServerIT.FramePeriodIsCloseToConfigured`: the measured frame period.
+- `RobustnessIT.*`: connection churn with fd and slot accounting, repeated kill -9, slot reuse, replies surviving a
+  client that pauses reading, stopping under load, floods that must not starve other clients, 10 clients competing
+  for 3 slots, input edge cases, UDP path changes, and configuration limits.
 
 Sample output from `./integration_tests`:
 
@@ -184,16 +208,24 @@ SIGINT. It exits with code 0 when everything passes.
 21/21 checks passed
 ```
 
-### ThreadSanitizer
+### Sanitizers
 
 ```bash
 cmake -S . -B build-tsan -DRADAR_SANITIZER=thread -DCMAKE_BUILD_TYPE=Debug
 setarch $(uname -m) -R bash -c 'cmake --build build-tsan -j && cd build-tsan && ctest'
+
+cmake -S . -B build-asan -DRADAR_SANITIZER=address,undefined -DCMAKE_BUILD_TYPE=Debug
+setarch $(uname -m) -R bash -c 'cmake --build build-asan -j && cd build-asan && ctest'
 ```
 
-`setarch -R` (ASLR off) works around GCC 11's TSan aborting with `unexpected memory mapping` on recent
+`setarch -R` (ASLR off) works around GCC 11's sanitizers aborting with `unexpected memory mapping` on recent
 kernels, including WSL2. `tests/tsan.supp` mutes one known GCC 11 libtsan false positive only; see the
 comment in that file.
+
+### Continuous integration
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every push to `main` and on pull requests: build, C++
+tests and smoke test with g++-9 and g++-13, plus the test suite under both sanitizer builds.
 
 ## Layout
 
@@ -203,6 +235,8 @@ src/
   bounded_queue.hpp      bounded queue (drop_oldest / drop_newest, drop counting)
   liveness.hpp           zombie rule
   backoff.hpp            reconnect delay (used by radar_client)
+  interval_stats.hpp     measured frame period
+  stream_stats.hpp       client-side loss and latency
   slot.hpp               slot states, close reasons
   protocol.{hpp,cpp}     command parsing
   line_buffer.{hpp,cpp}  TCP stream → lines

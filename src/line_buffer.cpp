@@ -16,7 +16,7 @@ bool LineBuffer::append(const char* data, std::size_t len) {
 
 std::optional<std::string> LineBuffer::next_line() {
     const auto pos = buf_.find('\n');
-    if (pos == std::string::npos) return std::nullopt;
+    if (pos == std::string::npos || pos > max_line_) return std::nullopt;
     std::string line = buf_.substr(0, pos);
     buf_.erase(0, pos + 1);
     if (!line.empty() && line.back() == '\r') line.pop_back();

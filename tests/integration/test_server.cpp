@@ -449,6 +449,42 @@ void expect_real_drops(Server& server, TestClient& c, const Config& cfg) {
 
     const auto sent_at_release = server.snapshot()[0].frames_sent;
     EXPECT_TRUE(wait_until([&] { return server.snapshot()[0].frames_sent > sent_at_release + 2; }, 2000ms));
+
+    // The client sees what the server dropped, as gaps in the frame numbers.
+    c.pump(100ms);
+    const auto dropped = server.snapshot()[0].frames_dropped;
+    std::cout << "  client saw lost=" << c.stream_stats().lost() << " (server dropped " << dropped << ")\n";
+    EXPECT_GT(c.stream_stats().lost(), 0u);
+    EXPECT_LE(c.stream_stats().lost(), dropped);
+    EXPECT_GE(c.stream_stats().lost() + cfg.queue_capacity + 1, dropped);
+}
+
+TEST_F(ServerIT, FramePeriodIsCloseToConfigured) {
+    ASSERT_TRUE(start());  // default 35 ms
+    std::this_thread::sleep_for(1500ms);
+    const auto period = server->stats().frame_period;
+    std::cout << "  " << period.count() << " intervals: avg=" << period.mean_us() / 1000.0
+              << " ms min=" << period.min_us() / 1000.0 << " ms max=" << period.max_us() / 1000.0
+              << " ms jitter=" << period.jitter_us() / 1000.0 << " ms\n";
+    EXPECT_GE(period.count(), 35u);
+    // The schedule is fixed-rate, so a late wake-up does not push later frames back.
+    // Single intervals depend on the OS scheduler and are reported, not asserted.
+    EXPECT_NEAR(period.mean_us(), 35000.0, 1500.0);
+}
+
+TEST_F(ServerIT, HealthyLoopbackClientSeesNoLossAndLowLatency) {
+    ASSERT_TRUE(start());
+    TestClient c;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(c));
+    ASSERT_NO_FATAL_FAILURE(start_streaming(c));
+    c.pump(1000ms);
+    const auto& s = c.stream_stats();
+    std::cout << "  received=" << s.received() << " lost=" << s.lost() << " latency avg="
+              << s.latency_mean_us() / 1000.0 << " ms max=" << s.latency_max_us() / 1000.0 << " ms\n";
+    EXPECT_GE(s.received(), 20u);
+    EXPECT_EQ(s.lost(), 0u);
+    EXPECT_GE(s.latency_min_us(), 0);
+    EXPECT_LT(s.latency_mean_us(), 10000.0);
 }
 
 }  // namespace

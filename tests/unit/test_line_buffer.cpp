@@ -47,6 +47,15 @@ TEST(LineBuffer, OverflowWithoutNewline) {
     EXPECT_TRUE(lb.overflowed());
 }
 
+TEST(LineBuffer, LinesBeforeAnOverlongLineAreKeptAndNothingAfterIt) {
+    LineBuffer lb(8);
+    EXPECT_FALSE(feed(lb, "ok\n123456789\nafter\n"));
+    EXPECT_EQ(*lb.next_line(), "ok");
+    EXPECT_FALSE(lb.next_line().has_value());
+    EXPECT_FALSE(lb.next_line().has_value());
+    EXPECT_TRUE(lb.overflowed());
+}
+
 TEST(LineBuffer, LongStreamOfShortLinesIsFine) {
     LineBuffer lb(8);
     std::string many;

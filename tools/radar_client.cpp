@@ -36,6 +36,7 @@
 #include "backoff.hpp"
 #include "line_buffer.hpp"
 #include "socket_util.hpp"
+#include "stream_stats.hpp"
 #include "track_frame.hpp"
 
 namespace {
@@ -66,6 +67,7 @@ struct Options {
 // Survives across reconnects, so the summary covers the whole run.
 struct Totals {
     radar::FrameReassembler reasm{32};
+    radar::StreamStats stream;
     std::uint64_t heartbeats = 0;
     std::uint64_t sessions = 0;
     std::uint64_t rejected_full = 0;
@@ -91,6 +93,21 @@ bool send_line(int fd, const std::string& line) {
 }
 
 bool starts_with(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
+
+std::uint64_t unix_time_us() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count());
+}
+
+// Loss and latency fields shared by the STATS and SUMMARY lines.
+std::string stream_fields(const radar::StreamStats& s) {
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "lost=%llu loss_pct=%.2f latency_ms_avg=%.2f latency_ms_max=%.2f",
+                  static_cast<unsigned long long>(s.lost()), s.loss_percent(), s.latency_mean_us() / 1000.0,
+                  static_cast<double>(s.latency_max_us()) / 1000.0);
+    return buf;
+}
 
 // Value of "key=<number>" in a server line, if present.
 std::optional<long> line_field(const std::string& line, const std::string& key) {
@@ -175,7 +192,10 @@ SessionEnd run_session(const Options& opt, const sockaddr_in& server, int udp, i
             for (;;) {
                 const ssize_t n = ::recv(udp, buf, sizeof buf, 0);
                 if (n < 0) break;
-                totals.reasm.add(buf, static_cast<std::size_t>(n));
+                const auto payload = totals.reasm.add(buf, static_cast<std::size_t>(n));
+                if (!payload) continue;
+                if (const auto frame = radar::deserialize_frame(payload->data(), payload->size()))
+                    totals.stream.on_frame(frame->seq, frame->timestamp_us, unix_time_us());
             }
         }
         if (!opt.quiet && Clock::now() - totals.last_report >= std::chrono::seconds(1)) {
@@ -183,7 +203,7 @@ SessionEnd run_session(const Options& opt, const sockaddr_in& server, int udp, i
             std::cout << "STATS fragments=" << totals.reasm.fragments()
                       << " frames=" << totals.reasm.frames_completed()
                       << " incomplete=" << totals.reasm.frames_abandoned()
-                      << " heartbeats=" << totals.heartbeats << std::endl;
+                      << " heartbeats=" << totals.heartbeats << " " << stream_fields(totals.stream) << std::endl;
         }
     }
 
@@ -206,7 +226,7 @@ void print_summary(const Totals& t) {
     std::cout << "SUMMARY fragments=" << t.reasm.fragments() << " frames=" << t.reasm.frames_completed()
               << " incomplete=" << t.reasm.frames_abandoned() << " invalid=" << t.reasm.invalid()
               << " heartbeats=" << t.heartbeats << " sessions=" << t.sessions
-              << " rejected_full=" << t.rejected_full << std::endl;
+              << " rejected_full=" << t.rejected_full << " " << stream_fields(t.stream) << std::endl;
 }
 
 }  // namespace
@@ -285,6 +305,7 @@ int main(int argc, char** argv) {
         // Fragments of the interrupted frame will never complete; a restarted server
         // also reuses frame numbers, so old pieces must not mix with new ones.
         totals.reasm.discard_pending();
+        totals.stream.new_session();
 
         // Up to 25% jitter, so clients cut off together do not all retry together.
         auto delay = backoff.next_delay();

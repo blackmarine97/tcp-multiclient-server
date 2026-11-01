@@ -65,6 +65,11 @@ public:
     std::vector<SlotSnapshot> snapshot() const;
     ServerStats stats() const;
 
+    // Test seam: simulates a stuck consumer. Slot `index`'s sender cannot start its next
+    // frame until the returned lock is released. Do not send STOP or close that slot
+    // meanwhile: the io thread waits for the sender at those points.
+    std::unique_lock<std::mutex> hold_sender_for_test(std::size_t index);
+
 private:
     struct FrameItem {
         std::shared_ptr<const PreparedFrame> frame;

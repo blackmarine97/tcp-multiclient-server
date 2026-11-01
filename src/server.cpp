@@ -41,13 +41,20 @@ struct Server::Slot {
     std::uint32_t hb_seq = 0;
 
     // ---- shared, guarded by mtx ----
-    // The sender holds mtx while sending a frame, so once the io thread has set the
-    // state away from STREAMING (under mtx) no further datagram goes to this client.
+    // Held only for a few field accesses, never across a send, so the producer
+    // cannot be held up by a slow consumer.
     mutable std::mutex mtx;
     SlotState state = SlotState::Free;
     sockaddr_in peer{};
     sockaddr_in udp_dest{};
     std::uint64_t generation = 0;  // bumped on every release; stale queue items are skipped
+
+    // Held by the sender for one whole frame. The sender rechecks the state before
+    // every fragment, so once the io thread has moved the state away from STREAMING
+    // and passed through this lock, no further datagram goes to this client.
+    // Lock order: send_mtx -> mtx.
+    std::mutex send_mtx;
+    void wait_for_in_flight_frame() { std::lock_guard<std::mutex> lk(send_mtx); }
 
     // ---- thread-safe ----
     BoundedQueue<FrameItem> queue;
@@ -354,6 +361,7 @@ void Server::handle_line(std::size_t i, const std::string& line) {
                     ok = true;
                 }
             }
+            s.wait_for_in_flight_frame();  // nothing is sent after the client reads OK STOPPED
             queue_line(i, ok ? "OK STOPPED" : "ERR NOT_REGISTERED");
             return;
         }
@@ -448,10 +456,11 @@ void Server::close_slot(std::size_t i, CloseReason reason, const char* bye) {
 
     sockaddr_in peer;
     {
-        std::lock_guard<std::mutex> lk(s.mtx);  // waits for an in-flight UDP send to finish
+        std::lock_guard<std::mutex> lk(s.mtx);
         s.state = SlotState::Closing;
         peer = s.peer;
     }
+    s.wait_for_in_flight_frame();
     const std::size_t discarded = s.queue.clear();
     ++closed_[static_cast<std::size_t>(reason)];  // counted before the peer can observe the close
 
@@ -531,24 +540,37 @@ void Server::sender_loop(std::size_t i) {
     Slot& s = *slots_[i];
     const int udp = udp_fds_[i].get();
     while (auto item = s.queue.pop()) {
-        std::lock_guard<std::mutex> lk(s.mtx);
-        if (s.state != SlotState::Streaming || s.generation != item->generation) {
-            ++stale_skipped_;
-            continue;
-        }
+        std::lock_guard<std::mutex> send_lk(s.send_mtx);
+        bool complete = true;
         for (const auto& frag : item->frame->fragments) {
+            sockaddr_in dest;
+            {
+                std::lock_guard<std::mutex> lk(s.mtx);
+                if (s.state != SlotState::Streaming || s.generation != item->generation) {
+                    complete = false;
+                    break;
+                }
+                dest = s.udp_dest;
+            }
             const ssize_t n = ::sendto(udp, frag.data(), frag.size(), 0,
-                                       reinterpret_cast<const sockaddr*>(&s.udp_dest), sizeof s.udp_dest);
+                                       reinterpret_cast<const sockaddr*>(&dest), sizeof dest);
             if (n == static_cast<ssize_t>(frag.size()))
                 ++s.fragments_sent;
             else
                 ++s.send_errors;
         }
-        ++s.frames_sent;
+        if (complete)
+            ++s.frames_sent;
+        else
+            ++stale_skipped_;
     }
 }
 
 // ---- introspection ----------------------------------------------------------
+
+std::unique_lock<std::mutex> Server::hold_sender_for_test(std::size_t index) {
+    return std::unique_lock<std::mutex>(slots_[index]->send_mtx);
+}
 
 std::vector<SlotSnapshot> Server::snapshot() const {
     std::vector<SlotSnapshot> out;

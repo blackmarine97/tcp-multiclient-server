@@ -81,12 +81,16 @@ flowchart LR
 
 ### 동기화 규칙과 경쟁 조건 처리
 
-- 슬롯의 공유 상태(`state`, `peer`, `udp_dest`, `generation`)는 슬롯 mutex로 보호.
-- **Sender는 슬롯 mutex를 잡은 채로 한 프레임을 보낸다.** IO 스레드가 STOP/해제로 상태를 바꿀 때도 같은 mutex를 잡으므로,
-  `OK STOPPED` 응답 이후나 슬롯 해제 이후에는 그 클라이언트로 데이터그램이 나가지 않는다(UDP 소켓은 non-blocking이라 락 보유 시간이 짧다).
+- 슬롯의 공유 상태(`state`, `peer`, `udp_dest`, `generation`)는 슬롯 `mtx`로 보호. **전송 중에는 잡지 않는다.**
+  Producer도 이 락을 잡으므로, 전송 중에 잡으면 느린 Sender가 Producer를 멈추고 결국 다른 클라이언트까지 늦춘다.
+  (초기 구현에 실제로 있던 버그다. 느린 소비자 테스트에서 1 ms 주기 Producer가 800 ms 동안 9프레임만 만드는 것으로 드러났고, 프레임이 버려지지도 않았다. 수정 후 481프레임.)
+- **전송 보장은 별도의 `send_mtx`로 만든다.** Sender는 프레임 하나를 보내는 동안 `send_mtx`를 잡고, **조각마다** 상태를 다시 확인한다.
+  IO 스레드는 STOP/해제 때 상태를 바꾼 뒤 `send_mtx`를 한 번 거쳐 진행 중인 프레임이 끝나기를 기다린다.
+  따라서 `OK STOPPED` 응답 이후나 슬롯 해제 이후에는 그 클라이언트로 데이터그램이 나가지 않고, 긴 프레임도 다음 조각에서 바로 중단된다.
+  (`REGISTER`로 목적지를 바꿀 때는 기다리지 않으므로 전송 중이던 조각 하나가 옛 포트로 갈 수 있다. UDP라 무해하다.)
 - **generation 카운터**: 슬롯이 해제될 때마다 증가. 큐 항목은 push 시점의 generation을 담고, Sender는 불일치 항목을 버린다.
   큐 정리와 재접속 사이 경쟁으로 이전 클라이언트의 프레임이 새 클라이언트에게 가는 일을 막는다.
-- 락 순서: 슬롯 mutex → 큐 mutex (Producer). Sender는 pop(큐 락만) 후 슬롯 락을 잡으므로 중첩 순서가 뒤집히지 않아 교착이 없다.
+- 락 순서: `send_mtx` → `mtx` (Sender), `mtx` → 큐 mutex (Producer). Sender는 pop을 락 없이 끝낸 뒤 `send_mtx`를 잡고, IO 스레드는 `mtx`를 놓은 뒤 `send_mtx`를 거치므로 순서가 뒤집히지 않아 교착이 없다.
 - 시그널: 모든 스레드에서 SIGINT/SIGTERM을 block하고 main이 `sigwait()`으로 받는다. 비동기 시그널 핸들러 안에서 하는 일이 없다.
   `SIGPIPE`는 무시 + `MSG_NOSIGNAL`.
 - ThreadSanitizer 빌드(`-DRADAR_SANITIZER=thread`)로 전체 테스트 실행 시 data race 보고 0건.
@@ -187,9 +191,9 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 기본 64 트랙 = 1552 바이트 → 조각 4개/프레임. 수신 측 `FrameReassembler`가 순서 무관 재조립, 중복 무시, 오래된 미완성 프레임 폐기를 담당한다.
 기본값 512는 조각화 동작을 보여주기 위한 값이며, 실제 망에서는 IP 단편화를 피하는 ~1400이 적절하다.
 
-### 클라이언트 재연결 (`radar_client --reconnect`)
+### 클라이언트 재연결 (`radar_client` 기본 동작)
 
-과제 요구사항은 아니지만 추가한 기능이다. **서버는 바꾸지 않고 클라이언트에만** 구현했다. 서버에게 재접속은 새 클라이언트와 같다.
+과제 요구사항은 아니지만 추가한 기능으로, 옵션 없이 항상 동작한다. **서버는 바꾸지 않고 클라이언트에만** 구현했다. 서버에게 재접속은 새 클라이언트와 같다.
 
 | 항목 | 동작 | 근거 |
 |---|---|---|
@@ -200,8 +204,6 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 | 포기 | `--max-retries N`회 연속 실패 시 종료 코드 3 (기본은 무한 재시도) | |
 | UDP 소켓 | 재접속해도 유지 (포트 동일) | 재등록할 포트가 바뀌지 않는다 |
 | 미완성 프레임 | 재접속 때 버리고 `incomplete`로 집계 | 재시작한 서버는 프레임 번호를 다시 쓰므로, 옛 조각이 새 프레임에 섞이면 안 된다 |
-
-플래그 없이 실행하면 기존 동작 그대로다(`ERR FULL`이면 종료 코드 2, 연결이 끊기면 종료).
 
 세션 복원은 넣지 않았다. 재접속하면 슬롯 번호가 바뀔 수 있고 카운터는 0부터 시작하며, 끊긴 동안의 프레임은 다시 보내지 않는다.
 트랙은 최신 값만 의미가 있어 재전송할 이유가 없고, 슬롯을 예약해 두면 3개뿐인 슬롯이 부재중인 클라이언트에게 묶이기 때문이다.
@@ -218,8 +220,12 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 | kill -9 → 슬롯 회수 | `ServerIT.KillDash9ClientReleasesSlotImmediately` | 실제 자식 프로세스 SIGKILL, zombie_timeout 30 s로 두어 **타이머가 아닌 EOF로** 회수됨을 증명 (~0 ms) |
 | | `ServerIT.KillDash9WhileFullLetsANewClientIn` | 만석 → kill -9 → 새 클라이언트 입장·수신 |
 | 정상 종료 | `QuitClosesGracefully`, `ServerShutdownSaysByeToEveryone` | `BYE` / `BYE SHUTDOWN` + EOF |
-| 재연결 (추가 기능) | `ReconnectBackoff.*` (unit), `ReconnectIT.*` | 좀비로 정리된 뒤 복귀, 만석 재시도, 서버 재시작, 서버 침묵 감지, 포기(종료 코드 3), 대기 중 Ctrl+C, 플래그 없을 때 기존 동작 유지 |
+| 재연결 (추가 기능) | `ReconnectBackoff.*` (unit), `ReconnectIT.*` | 좀비로 정리된 뒤 복귀, 만석 재시도, 서버 재시작, 서버 침묵 감지, 포기(종료 코드 3), 대기 중 Ctrl+C, 옵션 없이 재연결 |
 | 큐 | `BoundedQueue.*` (unit) | drop_oldest/newest 동작과 집계, close 시 소비자 깨우기, 4 생산자 경쟁에서 `소비 + 드롭 == 생산` |
+| 실제 프레임 드롭 | `ServerIT.StuckConsumerDrops*` | Sender를 멈춰 세워(`hold_sender_for_test`, 실행 속도와 무관) 프레임이 실제로 버려지고 `STATUS`와 서버 통계에 집계되며, Producer는 주기를 유지하고, 풀어주면 전송이 재개되는지 확인 (drop_oldest, drop_newest 각각) |
+| 클라이언트 격리 | `ServerIT.StuckConsumerDoesNotAffectOtherClients` | 한 슬롯의 Sender가 멈춰도 다른 클라이언트는 드롭 없이 거의 모든 프레임을 받음 |
+| 긴 프레임 중 STOP | `ServerIT.StopTakesEffectInTheMiddleOfALongFrame` | `OK STOPPED` 이후 조각이 더 나가지 않음 |
+| 읽지 않는 클라이언트 | `ServerIT.ClientThatStopsReadingIsReapedAsStalled` | 보내기만 하고 읽지 않아 타이머로는 못 잡는 클라이언트를 출력 버퍼 초과로 정리, 다른 클라이언트는 영향 없음 |
 
 모든 통합 테스트는 포트 0(임시 포트)을 써서 병렬 실행이 가능하고, 타이밍 의존 테스트는 짧은 하트비트(100~200 ms)로 빠르게 끝난다(전체 약 2 s).
 

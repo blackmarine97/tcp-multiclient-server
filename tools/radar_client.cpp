@@ -2,20 +2,18 @@
 //
 //   radar_client [--host 127.0.0.1] [--port 8088] [--udp-port 0] [--duration-ms 0]
 //                [--no-pong] [--no-start] [--quiet]
-//                [--reconnect] [--reconnect-min-ms 1000] [--reconnect-max-ms 8000]
+//                [--reconnect-min-ms 1000] [--reconnect-max-ms 8000]
 //                [--max-retries 0]
 //
 // Connects, REGISTERs a UDP port, STARTs streaming, answers heartbeats and
-// counts received fragments / reassembled frames. --duration-ms 0 runs until
-// Ctrl+C or until the server closes the connection.
+// counts received fragments / reassembled frames. --duration-ms 0 runs until Ctrl+C.
 //
-// With --reconnect a lost connection, a refused connection, ERR FULL or a silent
-// server no longer ends the program: it retries with exponential backoff and
-// sends REGISTER / START again. Only the client retries; the server treats every
-// reconnect as a brand-new client. --max-retries N gives up after N consecutive
-// failures (0 = never).
+// A lost connection, a refused connection, ERR FULL or a silent server do not end
+// the program: it retries with exponential backoff and sends REGISTER / START again.
+// Only the client retries; the server treats every reconnect as a brand-new client.
+// --max-retries N gives up after N consecutive failures (0 = never).
 //
-// Exit codes: 0 ok, 1 error, 2 rejected with ERR FULL, 3 gave up reconnecting.
+// Exit codes: 0 ok, 1 bad arguments or local setup error, 3 gave up reconnecting.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -60,7 +58,6 @@ struct Options {
     bool pong = true;
     bool start = true;
     bool quiet = false;
-    bool reconnect = false;
     long reconnect_min_ms = 1000;
     long reconnect_max_ms = 8000;
     int max_retries = 0;
@@ -124,7 +121,7 @@ SessionEnd run_session(const Options& opt, const sockaddr_in& server, int udp, i
                        Totals& totals) {
     radar::UniqueFd tcp(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
     if (!tcp.valid() || ::connect(tcp.get(), reinterpret_cast<const sockaddr*>(&server), sizeof server) != 0) {
-        if (!g_interrupted && (!opt.reconnect || !opt.quiet)) std::perror("connect");
+        if (!g_interrupted && !opt.quiet) std::perror("connect");
         return SessionEnd::ConnectFailed;
     }
 
@@ -136,7 +133,7 @@ SessionEnd run_session(const Options& opt, const sockaddr_in& server, int udp, i
     while (!g_interrupted) {
         const auto now = Clock::now();
         if (deadline && now >= *deadline) break;
-        if (opt.reconnect && now - last_rx >= silence_limit) {
+        if (now - last_rx >= silence_limit) {
             if (!opt.quiet) std::cout << "server silent for " << silence_limit.count() << " ms" << std::endl;
             return SessionEnd::Lost;
         }
@@ -226,14 +223,13 @@ int main(int argc, char** argv) {
         else if (a == "--no-pong") opt.pong = false;
         else if (a == "--no-start") opt.start = false;
         else if (a == "--quiet") opt.quiet = true;
-        else if (a == "--reconnect") opt.reconnect = true;
         else if (a == "--reconnect-min-ms") opt.reconnect_min_ms = std::max(1L, std::atol(next().c_str()));
         else if (a == "--reconnect-max-ms") opt.reconnect_max_ms = std::max(1L, std::atol(next().c_str()));
         else if (a == "--max-retries") opt.max_retries = std::atoi(next().c_str());
         else {
             std::cerr << "usage: " << argv[0]
                       << " [--host H] [--port P] [--udp-port U] [--duration-ms N] [--no-pong] [--no-start]"
-                         " [--quiet] [--reconnect] [--reconnect-min-ms N] [--reconnect-max-ms N]"
+                         " [--quiet] [--reconnect-min-ms N] [--reconnect-max-ms N]"
                          " [--max-retries N]\n";
             return 1;
         }
@@ -278,15 +274,6 @@ int main(int argc, char** argv) {
         const SessionEnd end = run_session(opt, server, udp.get(), my_udp_port, deadline, backoff, totals);
         if (end == SessionEnd::Full) ++totals.rejected_full;
         if (end == SessionEnd::Finished) break;
-
-        if (!opt.reconnect) {
-            if (end == SessionEnd::Full) {
-                std::cout << "REJECTED: server is full" << std::endl;
-                return 2;
-            }
-            if (end == SessionEnd::ConnectFailed) return 1;
-            break;  // Lost: the run is over
-        }
 
         if (g_interrupted || (deadline && Clock::now() >= *deadline)) break;
         if (opt.max_retries > 0 && backoff.failures() >= opt.max_retries) {

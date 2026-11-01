@@ -1,4 +1,4 @@
-// radar_client --reconnect against a real Server: the client is a real child
+// radar_client reconnecting against a real Server: the client is a real child
 // process, and what it did is observed from the server's side.
 
 #include <gtest/gtest.h>
@@ -69,7 +69,7 @@ private:
     pid_t pid_ = -1;
 };
 
-const std::vector<std::string> kFastReconnect = {"--reconnect", "--reconnect-min-ms", "50", "--reconnect-max-ms", "200"};
+const std::vector<std::string> kFastReconnect = {"--reconnect-min-ms", "50", "--reconnect-max-ms", "200"};
 
 std::vector<std::string> fast_reconnect_plus(std::vector<std::string> more) {
     auto all = kFastReconnect;
@@ -213,20 +213,20 @@ TEST_F(ReconnectIT, GivesUpAfterMaxRetriesWithExitCode3) {
 }
 
 TEST_F(ReconnectIT, CtrlCInterruptsALongBackoffPromptly) {
-    Child client(unused_port(), {"--reconnect", "--reconnect-min-ms", "60000", "--reconnect-max-ms", "60000"});
+    Child client(unused_port(), {"--reconnect-min-ms", "60000", "--reconnect-max-ms", "60000"});
     std::this_thread::sleep_for(200ms);  // now sleeping in its first 60 s backoff
     client.signal(SIGINT);
     EXPECT_EQ(client.wait_exit(1000ms), 0);
 }
 
 TEST_F(ReconnectIT, DurationEndsTheRunEvenWhileRetrying) {
-    Child client(unused_port(), {"--reconnect", "--reconnect-min-ms", "60000", "--reconnect-max-ms", "60000",
+    Child client(unused_port(), {"--reconnect-min-ms", "60000", "--reconnect-max-ms", "60000",
                                  "--duration-ms", "300"});
     EXPECT_EQ(client.wait_exit(2000ms), 0);
 }
 
-// Without the flag nothing changes: a full server still ends the program with code 2.
-TEST_F(ReconnectIT, WithoutTheFlagErrFullStillExitsWithCode2) {
+// A full server is retried like any other failure, and --max-retries bounds it.
+TEST_F(ReconnectIT, FullServerGivesUpAfterMaxRetriesWithExitCode3) {
     cfg.max_clients = 1;
     cfg.heartbeat_interval = 10s;
     cfg.zombie_timeout = 30s;
@@ -235,16 +235,21 @@ TEST_F(ReconnectIT, WithoutTheFlagErrFullStillExitsWithCode2) {
     ASSERT_TRUE(holder.connect(server->port()));
     ASSERT_TRUE(holder.read_reply());
 
-    Child client(server->port(), {});
-    EXPECT_EQ(client.wait_exit(3000ms), 2);
-    EXPECT_EQ(server->stats().rejected_full, 1u);
+    Child client(server->port(), fast_reconnect_plus({"--max-retries", "2"}));
+    EXPECT_EQ(client.wait_exit(3000ms), 3);
+    EXPECT_EQ(server->stats().rejected_full, 3u);  // first attempt + 2 retries
 }
 
-TEST_F(ReconnectIT, WithoutTheFlagALostConnectionEndsTheRun) {
+// Reconnecting is the default: no option is needed, even with the default delays.
+TEST_F(ReconnectIT, ReconnectsWithNoOptions) {
     ASSERT_TRUE(start());
-    Child client(server->port(), {});
+    const std::uint16_t port = server->port();
+    Child client(port, {});
     ASSERT_TRUE(wait_until([&] { return streaming() == 1; }, 3000ms));
-    server->stop();
-    EXPECT_EQ(client.wait_exit(3000ms), 0);
-    EXPECT_EQ(server->stats().accepted, 1u);
+
+    server->stop();  // BYE SHUTDOWN must not end the client
+    server.reset();
+    cfg.tcp_port = port;
+    ASSERT_TRUE(start());
+    EXPECT_TRUE(wait_until([&] { return streaming() == 1; }, 5000ms));
 }

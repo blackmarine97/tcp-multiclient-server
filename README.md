@@ -58,26 +58,21 @@ Config file [config/server.conf](config/server.conf):
 
 ### Client
 
-Demo client (automatically sends REGISTER and START, answers heartbeats, counts received fragments and frames):
+Demo client (automatically sends REGISTER and START, answers heartbeats, reconnects, counts received fragments
+and frames). It runs until Ctrl+C or for `--duration-ms N`:
 
 ```bash
 ./build/radar_client --port 8088
 ```
 
-Options: `--host`, `--udp-port`, `--duration-ms N` (0 = run forever), `--no-pong` (behave like a zombie),
-`--no-start`, `--quiet`. If the server is full, it prints `REJECTED: server is full` and exits with code 2.
+Options: `--host`, `--udp-port`, `--duration-ms N` (0 = run until Ctrl+C), `--no-pong` (behave like a zombie),
+`--no-start`, `--quiet`, `--reconnect-min-ms N`, `--reconnect-max-ms N`, `--max-retries N`.
 
-To keep the client running through failures, add `--reconnect`:
-
-```bash
-./build/radar_client --port 8088 --reconnect
-```
-
-It retries after a lost connection, a refused connection, `ERR FULL`, or a server that has gone silent (no
-heartbeat within the `timeout_ms` announced in `WELCOME`). Delays double from `--reconnect-min-ms` (default
-1000) up to `--reconnect-max-ms` (default 8000), plus up to 25% random jitter. Each new connection sends
-`REGISTER` and `START` again on the same UDP port, and the `SUMMARY` totals cover the whole run.
-`--max-retries N` gives up with exit code 3 after N consecutive failures (default 0 = never).
+The client always reconnects, with no option needed. It retries after a lost connection, a refused connection,
+`ERR FULL`, or a server that has gone silent (no data within the `timeout_ms` announced in `WELCOME`). Delays
+double from `--reconnect-min-ms` (default 1000) up to `--reconnect-max-ms` (default 8000), plus up to 25% random
+jitter. Each new connection sends `REGISTER` and `START` again on the same UDP port, and the `SUMMARY` totals
+cover the whole run. `--max-retries N` gives up with exit code 3 after N consecutive failures (default 0 = never).
 
 Reconnecting is client-side only. The server treats a reconnect as a new client: the slot number may differ,
 its counters start from 0, and frames missed while disconnected are not resent.
@@ -120,8 +115,8 @@ The full protocol is in DESIGN.md §6.
 
 ### Demo scenario
 
-3 clients connect → a 4th is rejected → one is killed with kill -9 → a new client takes the freed slot →
-the server is stopped with SIGINT:
+3 clients connect → a 4th is rejected and keeps retrying → one is killed with kill -9 → the waiting client takes
+the freed slot → the server restarts while the clients reconnect by themselves:
 
 ```bash
 bash scripts/demo.sh build
@@ -131,7 +126,7 @@ bash scripts/demo.sh build
 
 ```bash
 cd build
-ctest --output-on-failure          # everything (47 unit + 23 integration)
+ctest --output-on-failure          # everything (47 unit + 28 integration)
 ctest -L unit                       # unit tests only
 ctest -L integration                # integration tests only
 ./integration_tests --gtest_filter='*Kill*'   # a single test (prints its measurements)
@@ -146,9 +141,14 @@ Required tests from the assignment:
 | 3 concurrent streams → fragments received per client | `ServerIT.ThreeClientsStreamConcurrently` |
 | Client killed with kill -9 → slot reclaimed | `ServerIT.KillDash9ClientReleasesSlotImmediately`, `ServerIT.KillDash9WhileFullLetsANewClientIn` |
 
-Beyond the assignment, `ReconnectIT.*` covers `radar_client --reconnect`: coming back after being reaped as a
-zombie, retrying a full server, surviving a server restart, detecting a silent server, giving up, and Ctrl+C
-during a backoff.
+Beyond the assignment:
+
+- `ReconnectIT.*`: client reconnecting after being reaped as a zombie, retrying a full server, surviving a server
+  restart, detecting a silent server, giving up, and Ctrl+C during a backoff.
+- `ServerIT.StuckConsumer*`: with one sender held, frames are really dropped and counted, the producer keeps its pace
+  (both overflow policies), and other clients lose nothing.
+- `ServerIT.ClientThatStopsReadingIsReapedAsStalled`: a client that sends but never reads, caught by the output
+  backlog limit rather than the heartbeat timer.
 
 Sample output from `./integration_tests`:
 

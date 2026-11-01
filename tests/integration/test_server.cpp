@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -407,4 +408,151 @@ TEST_F(ServerIT, QueueAccountsForEveryFrame) {
     EXPECT_EQ(st.frames_dropped, snap.frames_dropped);
     // Every frame produced while streaming was either sent, dropped, or is still queued.
     EXPECT_GE(st.frames_produced, snap.frames_sent + snap.frames_dropped);
+}
+
+namespace {
+
+Config slow_consumer_config(Config cfg) {
+    cfg.frame_interval = 1ms;
+    cfg.queue_capacity = 1;
+    cfg.tracks_per_frame = 1000;                       // 24 KB per frame
+    cfg.max_datagram_bytes = kFragmentHeaderSize + 1;  // -> 24016 datagrams per frame
+    return cfg;
+}
+
+// With the sender of slot 0 held, its queue must overflow: the producer keeps its pace,
+// every discarded frame shows up in the counters, and sending resumes on release.
+void expect_real_drops(Server& server, TestClient& c, const Config& cfg) {
+    {
+        auto held = server.hold_sender_for_test(0);
+        const auto produced_before = server.stats().frames_produced;
+        const auto sent_before = server.snapshot()[0].frames_sent;
+        c.pump(400ms);
+
+        const auto produced = server.stats().frames_produced - produced_before;
+        const auto snap = server.snapshot()[0];
+        std::cout << "  while stuck: produced=" << produced << " sent=" << snap.frames_sent - sent_before
+                  << " dropped=" << snap.frames_dropped << "\n";
+
+        EXPECT_GE(produced, static_cast<std::uint64_t>(200ms / cfg.frame_interval));  // half pace is plenty
+        EXPECT_EQ(snap.frames_sent, sent_before);
+        EXPECT_EQ(snap.queue_depth, cfg.queue_capacity);
+        EXPECT_GE(snap.frames_dropped + cfg.queue_capacity + 1, produced);  // only the queue and one in hand survive
+        EXPECT_GT(snap.frames_dropped, 0u);
+        EXPECT_EQ(server.stats().frames_dropped, snap.frames_dropped);
+
+        ASSERT_TRUE(c.send_line("STATUS"));
+        const auto status = c.read_reply();
+        ASSERT_TRUE(status);
+        EXPECT_GT(status_field(*status, "dropped"), 0u);
+    }
+
+    const auto sent_at_release = server.snapshot()[0].frames_sent;
+    EXPECT_TRUE(wait_until([&] { return server.snapshot()[0].frames_sent > sent_at_release + 2; }, 2000ms));
+}
+
+}  // namespace
+
+TEST_F(ServerIT, StuckConsumerDropsOldestFramesAndCountsThem) {
+    cfg.frame_interval = 5ms;
+    cfg.queue_capacity = 2;
+    ASSERT_TRUE(start());
+    TestClient c;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(c));
+    ASSERT_NO_FATAL_FAILURE(start_streaming(c));
+    ASSERT_NO_FATAL_FAILURE(expect_real_drops(*server, c, cfg));
+}
+
+TEST_F(ServerIT, StuckConsumerDropsNewestFramesAndCountsThem) {
+    cfg.frame_interval = 5ms;
+    cfg.queue_capacity = 2;
+    cfg.queue_overflow = OverflowPolicy::DropNewest;
+    ASSERT_TRUE(start());
+    TestClient c;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(c));
+    ASSERT_NO_FATAL_FAILURE(start_streaming(c));
+    ASSERT_NO_FATAL_FAILURE(expect_real_drops(*server, c, cfg));
+}
+
+// The point of per-client queues: one stuck client costs the others nothing.
+TEST_F(ServerIT, StuckConsumerDoesNotAffectOtherClients) {
+    cfg.frame_interval = 5ms;
+    cfg.queue_capacity = 2;
+    ASSERT_TRUE(start());
+    TestClient stuck, other;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(stuck));   // slot 0
+    ASSERT_NO_FATAL_FAILURE(connect_ok(other));   // slot 1
+    ASSERT_NO_FATAL_FAILURE(start_streaming(stuck));
+    ASSERT_NO_FATAL_FAILURE(start_streaming(other));
+
+    auto held = server->hold_sender_for_test(0);
+    const auto produced_before = server->stats().frames_produced;
+    const auto other_before = other.udp_stats().frames_completed();
+    other.pump(400ms);
+    const auto produced = server->stats().frames_produced - produced_before;
+    const auto received = other.udp_stats().frames_completed() - other_before;
+    std::cout << "  slot 0 stuck: produced=" << produced << " other client received=" << received << "\n";
+
+    EXPECT_GT(server->snapshot()[0].frames_dropped, 0u);
+    EXPECT_EQ(server->snapshot()[1].frames_dropped, 0u);
+    EXPECT_GE(received + 2, produced);  // the other client got essentially every frame
+    EXPECT_GE(produced, 40u);           // 80 expected at 5 ms
+}
+
+// STOP has to stay final even in the middle of a long frame.
+TEST_F(ServerIT, StopTakesEffectInTheMiddleOfALongFrame) {
+    cfg = slow_consumer_config(cfg);
+    ASSERT_TRUE(start());
+    TestClient c;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(c));
+    ASSERT_NO_FATAL_FAILURE(start_streaming(c));
+    c.pump(100ms);
+
+    ASSERT_TRUE(c.send_line("STOP"));
+    ASSERT_EQ(c.read_reply(1000ms), "OK STOPPED");
+    const auto at_stop = server->snapshot()[0].fragments_sent;
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(server->snapshot()[0].fragments_sent, at_stop);
+}
+
+// ---- stalled client ---------------------------------------------------------
+
+// A client that keeps sending but stops reading never looks dead to the heartbeat
+// check (bytes keep arriving), so only the output backlog limit can catch it.
+TEST_F(ServerIT, ClientThatStopsReadingIsReapedAsStalled) {
+    cfg.max_line_bytes = 60000;    // lets PING produce large replies
+    cfg.heartbeat_interval = 10s;  // no help from the timer...
+    cfg.zombie_timeout = 30s;      // ...this has to be the backlog check
+    ASSERT_TRUE(start());
+
+    TestClient healthy;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(healthy));
+
+    UniqueFd stalled(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    const int small = 4096;
+    ::setsockopt(stalled.get(), SOL_SOCKET, SO_RCVBUF, &small, sizeof small);  // before connect()
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(server->port());
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::connect(stalled.get(), reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+    ASSERT_TRUE(wait_until([&] { return server->active_clients() == 2; }, 1000ms));
+
+    const std::string ping = "PING " + std::string(50000, 'x') + "\n";
+    const auto deadline = SteadyClock::now() + 15s;
+    while (server->stats().closed_by(CloseReason::Stalled) == 0 && SteadyClock::now() < deadline) {
+        const ssize_t n = ::send(stalled.get(), ping.data(), ping.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) break;  // server hung up
+        if (n < 0) std::this_thread::sleep_for(1ms);
+    }
+
+    ASSERT_TRUE(wait_until([&] { return server->stats().closed_by(CloseReason::Stalled) == 1; }, 2000ms));
+    EXPECT_EQ(server->stats().closed_by(CloseReason::Timeout), 0u);
+    ASSERT_TRUE(wait_until([&] { return server->active_clients() == 1; }, 1000ms));
+
+    // The stalled client's slot is free and the other client never noticed.
+    ASSERT_TRUE(healthy.send_line("PING ok"));
+    EXPECT_EQ(healthy.read_reply(), "PONG ok");
+    TestClient next;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(next));
 }

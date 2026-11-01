@@ -19,6 +19,9 @@ public:
     // it are never returned, while the lines before it still are.
     std::optional<std::string> next_line();
 
+    // True when next_line() would return a line.
+    bool has_line() const;
+
     void clear();
     bool overflowed() const { return overflow_; }
     std::size_t pending_bytes() const { return buf_.size(); }

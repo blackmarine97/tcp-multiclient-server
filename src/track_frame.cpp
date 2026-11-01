@@ -170,6 +170,12 @@ std::optional<std::vector<std::uint8_t>> FrameReassembler::add(const std::uint8_
     }
     ++fragments_;
 
+    if (std::find(recently_completed_.begin(), recently_completed_.end(), h->frame_seq) !=
+        recently_completed_.end()) {
+        ++duplicates_;
+        return std::nullopt;
+    }
+
     auto it = pending_.find(h->frame_seq);
     if (it == pending_.end()) {
         if (pending_.size() >= max_pending_) {  // give up on the oldest incomplete frame
@@ -197,6 +203,8 @@ std::optional<std::vector<std::uint8_t>> FrameReassembler::add(const std::uint8_
     std::vector<std::uint8_t> done = std::move(p.data);
     pending_.erase(it);
     ++completed_;
+    recently_completed_.push_back(h->frame_seq);
+    if (recently_completed_.size() > max_pending_) recently_completed_.pop_front();
     return done;
 }
 

@@ -80,6 +80,33 @@ TEST(Fragmentation, ReassemblesOutOfOrderAndIgnoresDuplicates) {
     EXPECT_EQ(r.fragments(), frags.size() + 1);
 }
 
+TEST(Fragmentation, DuplicateAfterCompletionDoesNotStartAPhantomFrame) {
+    FakeTrackGenerator gen(64);
+    const auto p = prepare_frame(gen.next(0, 0.035), 512);
+    FrameReassembler r;
+    for (const auto& f : p.fragments) r.add(f.data(), f.size());
+    ASSERT_EQ(r.frames_completed(), 1u);
+
+    for (const auto& f : p.fragments) EXPECT_FALSE(r.add(f.data(), f.size()));
+    EXPECT_EQ(r.frames_completed(), 1u);  // not counted twice
+    EXPECT_EQ(r.duplicates(), p.fragments.size());
+    r.discard_pending();
+    EXPECT_EQ(r.frames_abandoned(), 0u);  // nothing was left half-built
+}
+
+TEST(Fragmentation, DiscardPendingForgetsCompletedFramesForARestartedServer) {
+    FakeTrackGenerator first(64), restarted(64);
+    const auto a = prepare_frame(first.next(0, 0.035), 512);
+    const auto b = prepare_frame(restarted.next(0, 0.035), 512);
+    ASSERT_EQ(a.seq, b.seq);
+
+    FrameReassembler r;
+    for (const auto& f : a.fragments) r.add(f.data(), f.size());
+    r.discard_pending();
+    for (const auto& f : b.fragments) r.add(f.data(), f.size());
+    EXPECT_EQ(r.frames_completed(), 2u);
+}
+
 TEST(Fragmentation, RejectsGarbage) {
     FrameReassembler r;
     std::vector<std::uint8_t> junk(40, 0xAB);

@@ -28,6 +28,7 @@ struct Config {
     std::size_t tracks_per_frame = 64;
     std::size_t max_datagram_bytes = 512;  // UDP payload per fragment, header included
     std::size_t max_line_bytes = 256;
+    std::size_t max_commands_per_sec = 100;  // per client, bursts up to the same number; 0 = off
 
     LogLevel log_level = LogLevel::Info;
 };

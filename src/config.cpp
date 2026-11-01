@@ -99,6 +99,9 @@ std::optional<Config> parse_config(std::istream& in, std::string* error) {
         } else if (key == "max_line_bytes") {
             if (!need_uint(16, 65536)) return fail(range_msg(16, 65536));
             cfg.max_line_bytes = n;
+        } else if (key == "max_commands_per_sec") {
+            if (!need_uint(0, 1000000)) return fail(range_msg(0, 1000000));
+            cfg.max_commands_per_sec = n;
         } else if (key == "log_level") {
             auto lvl = parse_log_level(value);
             if (!lvl) return fail("log_level must be debug|info|warn|error|off");
@@ -132,6 +135,11 @@ std::string validate_config(const Config& cfg) {
         return "zombie_timeout_ms must be greater than heartbeat_interval_ms";
     if (cfg.max_datagram_bytes <= kFragmentHeaderSize)
         return "max_datagram_bytes must be larger than the fragment header";
+    // Heartbeat answers are commands too: the limit must leave room for them, or a
+    // healthy client would fall behind and be declared a zombie.
+    if (cfg.max_commands_per_sec > 0 &&
+        static_cast<long long>(cfg.max_commands_per_sec) * cfg.heartbeat_interval.count() < 2000)
+        return "max_commands_per_sec is too low for heartbeat_interval_ms (needs at least 2 commands per heartbeat)";
     if (cfg.max_clients == 0) return "max_clients must be at least 1";
     if (cfg.queue_capacity == 0) return "queue_capacity must be at least 1";
     return {};

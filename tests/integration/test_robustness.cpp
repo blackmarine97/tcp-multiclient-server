@@ -271,6 +271,7 @@ TEST_F(RobustnessIT, FramesQueuedForTheOldClientNeverReachTheNewOne) {
 // receive every reply, complete and in order: the send buffer fills, part of the output
 // waits in the server, and POLLOUT has to finish the job.
 TEST_F(RobustnessIT, RepliesSurviveAClientThatPausesReading) {
+    cfg.max_commands_per_sec = 0;  // about output backlog, not about the rate limit
     cfg.max_line_bytes = 60000;
     cfg.heartbeat_interval = 10s;
     cfg.zombie_timeout = 30s;
@@ -429,7 +430,9 @@ TEST_F(RobustnessIT, FloodOfRejectedConnectionsDoesNotStarveExistingClients) {
 }
 
 // Same for a client sending commands as fast as it can.
+// The limit is off here: fairness of the IO thread has to hold on its own.
 TEST_F(RobustnessIT, FloodingClientDoesNotStarveOtherClients) {
+    cfg.max_commands_per_sec = 0;
     cfg.heartbeat_interval = 100ms;
     cfg.zombie_timeout = 1000ms;
     ASSERT_TRUE(start());
@@ -458,6 +461,149 @@ TEST_F(RobustnessIT, FloodingClientDoesNotStarveOtherClients) {
               << " ms, heartbeats=" << healthy.heartbeats() << "\n";
     EXPECT_LT(worst.count(), 200);
     EXPECT_GE(healthy.heartbeats(), 5u);
+    EXPECT_EQ(server->stats().closed_by(CloseReason::Timeout), 0u);
+}
+
+// ---- command rate limit -----------------------------------------------------
+
+// The flooder only gets its allowance, stays connected, and is not mistaken for a zombie.
+TEST_F(RobustnessIT, FloodIsLimitedToTheConfiguredRate) {
+    cfg.max_commands_per_sec = 100;
+    cfg.heartbeat_interval = 100ms;
+    cfg.zombie_timeout = 500ms;  // shorter than the flood: throttling must not look like silence
+    ASSERT_TRUE(start());
+    TestClient flooder;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(flooder));
+
+    std::string batch;
+    for (int i = 0; i < 500; ++i) batch += "PING f\n";
+    std::string received;
+    char sink[65536];
+    const auto t0 = SteadyClock::now();
+    while (SteadyClock::now() - t0 < 1500ms) {
+        ::send(flooder.tcp_fd(), batch.data(), batch.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        ssize_t n;
+        while ((n = ::recv(flooder.tcp_fd(), sink, sizeof sink, MSG_DONTWAIT)) > 0)
+            received.append(sink, static_cast<std::size_t>(n));
+        std::this_thread::sleep_for(1ms);
+    }
+
+    std::size_t pongs = 0;
+    for (auto pos = received.find("PONG f\n"); pos != std::string::npos; pos = received.find("PONG f\n", pos + 1))
+        ++pongs;
+    const auto snap = server->snapshot()[0];
+    std::cout << "  answered " << pongs << " commands in 1.5 s, throttled " << snap.throttle_events << " times\n";
+
+    EXPECT_GE(pongs, 200u);  // burst of 100 + 150 at the rate, give or take the scheduler
+    EXPECT_LE(pongs, 260u);
+    EXPECT_GT(snap.throttle_events, 0u);
+    EXPECT_EQ(server->active_clients(), 1u);
+    EXPECT_EQ(server->stats().closed_by(CloseReason::Timeout), 0u);
+}
+
+// The limit applies to the TCP commands only. The track stream is a separate path, so
+// even the client being throttled keeps receiving every frame, on time.
+TEST_F(RobustnessIT, ThrottledClientKeepsReceivingEveryTrackFrame) {
+    cfg.max_commands_per_sec = 100;
+    ASSERT_TRUE(start());
+    TestClient flooder, quiet;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(flooder));
+    ASSERT_NO_FATAL_FAILURE(connect_ok(quiet));
+    ASSERT_NO_FATAL_FAILURE(start_streaming(flooder));
+    ASSERT_NO_FATAL_FAILURE(start_streaming(quiet));
+
+    std::string batch;
+    for (int i = 0; i < 500; ++i) batch += "PING f\n";
+    std::thread other([&] { quiet.pump(2000ms); });
+    const auto t0 = SteadyClock::now();
+    while (SteadyClock::now() - t0 < 2000ms) {
+        ::send(flooder.tcp_fd(), batch.data(), batch.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        flooder.pump(5ms);
+    }
+    other.join();
+
+    const auto snap = server->snapshot();
+    const auto& fs = flooder.stream_stats();
+    const auto& qs = quiet.stream_stats();
+    std::cout << "  throttled " << snap[0].throttle_events << " times | flooder: frames=" << fs.received()
+              << " lost=" << fs.lost() << " latency max=" << fs.latency_max_us() / 1000.0 << " ms | quiet: frames="
+              << qs.received() << " lost=" << qs.lost() << " | period max="
+              << server->stats().frame_period.max_us() / 1000.0 << " ms\n";
+
+    EXPECT_GT(snap[0].throttle_events, 0u);
+    EXPECT_EQ(snap[0].frames_dropped, 0u);
+    EXPECT_EQ(fs.lost(), 0u);
+    EXPECT_EQ(qs.lost(), 0u);
+    EXPECT_GE(fs.received(), 50u);  // about 57 frames in 2 s at 35 ms
+    EXPECT_NEAR(static_cast<double>(fs.received()), static_cast<double>(qs.received()), 3.0);
+}
+
+TEST_F(RobustnessIT, BurstWithinTheLimitIsNotThrottled) {
+    cfg.max_commands_per_sec = 100;
+    ASSERT_TRUE(start());
+    TestClient c;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(c));
+
+    std::string burst;
+    for (int i = 0; i < 80; ++i) burst += "PING " + std::to_string(i) + "\n";
+    ASSERT_TRUE(c.send_raw(burst));
+    for (int i = 0; i < 80; ++i) ASSERT_EQ(c.read_reply(), "PONG " + std::to_string(i));
+    EXPECT_EQ(server->snapshot()[0].throttle_events, 0u);
+}
+
+// Throttling delays commands; it never loses or reorders them, and QUIT still works.
+TEST_F(RobustnessIT, ThrottledCommandsAreAllAnsweredInOrder) {
+    cfg.max_commands_per_sec = 100;
+    ASSERT_TRUE(start());
+    TestClient c;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(c));
+
+    std::string burst;
+    for (int i = 0; i < 150; ++i) burst += "PING " + std::to_string(i) + "\n";
+    burst += "QUIT\n";
+    ASSERT_TRUE(c.send_raw(burst));
+
+    const auto t0 = SteadyClock::now();
+    for (int i = 0; i < 150; ++i) ASSERT_EQ(c.read_reply(), "PONG " + std::to_string(i));
+    EXPECT_EQ(c.read_reply(), "BYE");
+    const auto ms = std::chrono::duration_cast<Ms>(SteadyClock::now() - t0).count();
+    std::cout << "  151 commands took " << ms << " ms\n";
+    EXPECT_GE(ms, 400);  // 51 above the burst at 10 ms each
+    EXPECT_TRUE(c.wait_eof(1000ms));
+}
+
+TEST_F(RobustnessIT, OneClientsLimitDoesNotAffectAnother) {
+    cfg.max_commands_per_sec = 100;
+    ASSERT_TRUE(start());
+    TestClient flooder, other;
+    ASSERT_NO_FATAL_FAILURE(connect_ok(flooder));
+    ASSERT_NO_FATAL_FAILURE(connect_ok(other));
+
+    std::string burst;
+    for (int i = 0; i < 1000; ++i) burst += "PING f\n";
+    ASSERT_TRUE(flooder.send_raw(burst));
+    ASSERT_TRUE(wait_until([&] { return server->snapshot()[0].throttle_events > 0; }, 1000ms));
+
+    for (int i = 0; i < 50; ++i) ASSERT_TRUE(other.send_line("PING o"));
+    for (int i = 0; i < 50; ++i) ASSERT_EQ(other.read_reply(), "PONG o");
+    EXPECT_EQ(server->snapshot()[1].throttle_events, 0u);
+}
+
+TEST_F(RobustnessIT, ThrottledClientThatDisconnectsIsStillReleased) {
+    cfg.max_commands_per_sec = 10;
+    cfg.heartbeat_interval = 1000ms;
+    cfg.zombie_timeout = 30s;
+    ASSERT_TRUE(start());
+    {
+        TestClient c;
+        ASSERT_NO_FATAL_FAILURE(connect_ok(c));
+        std::string burst;
+        for (int i = 0; i < 500; ++i) burst += "PING x\n";
+        ASSERT_TRUE(c.send_raw(burst));
+        ASSERT_TRUE(wait_until([&] { return server->snapshot()[0].throttle_events > 0; }, 1000ms));
+    }
+    // It may take a moment to get through what it already sent, but not the zombie timeout.
+    EXPECT_TRUE(wait_until([&] { return server->active_clients() == 0; }, 5000ms));
     EXPECT_EQ(server->stats().closed_by(CloseReason::Timeout), 0u);
 }
 

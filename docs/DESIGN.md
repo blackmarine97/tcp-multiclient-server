@@ -72,6 +72,14 @@ flowchart LR
 - **IO 스레드는 한 소켓에 오래 머물지 않는다.** 스레드 하나가 모든 소켓을 처리하므로, `poll()` 한 라운드에 소켓당 읽기 4회(16 KB), accept 16회까지만 처리한다.
   `poll()`은 level-triggered라 남은 데이터는 다음 라운드에 다시 잡힌다.
   (초기 구현은 소켓을 비울 때까지 읽어서, 명령을 쉬지 않고 보내는 클라이언트 하나가 다른 클라이언트의 응답과 하트비트를 3초 이상 완전히 막았다. `FloodingClientDoesNotStarveOtherClients` 테스트로 발견했고, 수정 후 최악 응답은 45 ms다.)
+- **fd가 바닥나도 멈추거나 헛돌지 않는다.** `accept()`가 `EMFILE`로 실패해도 대기 중인 접속은 남아 있어, 그냥 두면 `poll()`이 계속 깨어나 CPU 100%로 돈다.
+  (실제로 있던 버그로, 2초에 로그 38 MB가 쌓였다.) 예비 fd 하나를 잡아 두었다가 그때 닫고 접속을 받아 `ERR BUSY`로 거절한 뒤 다시 잡는다. 그 밖의 `accept()` 실패에는 100 ms 쉬며, 로그는 문제가 이어지는 동안 한 번만 남긴다.
+- **명령 속도 제한(토큰 버킷).** 클라이언트마다 초당 `max_commands_per_sec`개(기본 100, 같은 수만큼 몰아 보내기 허용). 공정성만으로는 폭주 중 IO 스레드 CPU가 100%에 가까우므로 양 자체를 제한한다.
+  - **끊지 않고 읽기를 멈춘다.** 잠깐 몰린 정상 명령 때문에 연결을 끊으면 안 되고, 읽지 않으면 TCP 흐름 제어가 상대 전송을 늦춘다. 명령은 늦어질 뿐 유실되거나 순서가 바뀌지 않는다.
+  - **트랙 데이터에는 영향이 없다.** 제한 대상은 TCP 명령뿐이고, UDP 트랙은 Producer → 큐 → Sender라는 별도 경로로 흐른다. 제한에 걸린 클라이언트도 프레임을 빠짐없이 받는다(`ThrottledClientKeepsReceivingEveryTrackFrame`).
+  - **좀비로 오판하지 않는다.** 대기 중인 명령을 처리할 때도 `last_rx`를 갱신하고, 설정 검증에서 하트비트당 최소 2개의 명령을 보장한다.
+  - **기본값 100의 근거:** 정상 클라이언트는 하트비트 응답 1개/초와 드문 제어 명령만 보낸다. 넘는 것은 그 클라이언트의 명령 응답이 늦어지는 것뿐이다.
+  - 측정(스트리밍 없음, 3초 폭주): 제한 없음 CPU 99%, 30만 명령/초 처리 → 제한 100 CPU 0.1% 미만, 133 명령/초 처리(초반 몰아 보내기 포함).
 
 ### 큐 정책 (크기 제한 · 가득 찼을 때 · 버린 개수)
 
@@ -155,6 +163,12 @@ kill -9는 흔히 "좀비"로 생각되지만, 실제로는 커널이 FIN을 보
 - PONG에 한정하지 않고 **어떤 명령이든 수신하면 생존**으로 본다(`last_rx` 갱신). 바쁜 클라이언트에게 추가 부담을 주지 않는다.
 - 기본값 `zombie_timeout = 3500 ms = 3 × heartbeat + 500 ms`.
 
+### 서버가 멈췄던 시간은 클라이언트 탓으로 치지 않는다
+
+서버 프로세스가 잠시 돌지 못하면(SIGSTOP, VM 일시 정지, 과부하) 그동안 하트비트가 나가지 않으므로 클라이언트는 답할 것이 없다.
+그대로 판정하면 깨어나자마자 정상 클라이언트를 모두 좀비로 끊는다(실제로 있던 버그).
+클라이언트가 연결돼 있으면 `poll()`은 적어도 하트비트 주기마다 깨어나므로, IO 라운드 간격이 `heartbeat_interval + 100 ms`를 넘으면 서버가 멈췄던 것으로 보고 그 시간만큼 `last_rx`를 뒤로 미룬다.
+
 ### 수치의 근거
 
 - **3회 연속 무응답**: 하트비트 1회 손실/지연(스케줄링 지연, GC 멈춤, TCP 재전송 — Linux 최소 RTO 200 ms)으로 정상 클라이언트를 끊지 않기 위함. 2회는 오탐 여지가 있고 5회 이상은 슬롯(최대 3개뿐) 회수가 너무 늦어진다.
@@ -171,12 +185,13 @@ kill -9는 흔히 "좀비"로 생각되지만, 실제로는 커널이 FIN을 보
 |---|---|---|
 | (접속) | `WELCOME RADARSIM/1.0 slot=<i> max=<n> hb_ms=<ms> timeout_ms=<ms>` | 환영 메시지 |
 | (접속, 만석) | `ERR FULL` 후 연결 종료 | |
+| (접속, 서버 fd 고갈) | `ERR BUSY` 후 연결 종료 | |
 | `REGISTER <udp_port>` | `OK REGISTERED udp=<ip>:<port>` | 목적지 IP는 **TCP 접속 주소로 고정** — 제3자에게 UDP를 쏘게 하는 반사 공격 방지 |
 | `START` | `OK STREAMING` / `ERR NOT_REGISTERED` | |
 | `STOP` | `OK STOPPED` / `ERR NOT_REGISTERED` | |
 | `PING [token]` | `PONG [token]` | 클라이언트 측 RTT 확인용 |
 | `PONG [seq]` | (없음) | 서버 `HB <seq>`에 대한 응답 |
-| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= send_errors= queue=a/b` | |
+| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= send_errors= throttled= queue=a/b` | |
 | `QUIT` | `BYE` 후 종료 | |
 | 그 외 | `ERR UNKNOWN_COMMAND <kw>` / `ERR BAD_ARGUMENT <msg>` | 연결 유지 |
 | 256 바이트 초과 줄 | `ERR LINE_TOO_LONG` 후 종료 | 메모리 고갈 방지 |
@@ -202,6 +217,7 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 |---|---|---|
 | 재시도 조건 | 연결 끊김, 접속 거부, `ERR FULL`, 서버 침묵 | Ctrl+C와 `--duration-ms` 만료는 사용자의 의도이므로 재시도하지 않는다 |
 | 서버 침묵 판정 | `WELCOME`의 `timeout_ms` 동안 TCP 수신이 없으면 끊긴 것으로 본다. `WELCOME` 자체가 5초 안에 안 오면 마찬가지 | 멈춘 서버나 망 단절은 TCP가 알려주지 않는다. 서버의 좀비 판정과 같은 문제를 반대 방향에서 푸는 것 |
+| 접속 시간 제한 | `connect()` 3초 (`--duration-ms`가 더 짧으면 그 시간) | 패킷이 사라지면 `connect()`가 약 2분 멈춘다. 네트워크가 돌아와도 커널의 SYN 재전송 간격을 기다리지 않고 새로 시도한다 |
 | 재시도 간격 | 1초부터 2배씩 늘려 최대 8초 + 무작위 0~25% | 죽은 서버를 쉴 새 없이 두드리지 않고, 함께 끊긴 클라이언트들이 동시에 몰리지 않게 한다 |
 | 간격 초기화 | `WELCOME`을 받으면 초기화 | TCP 연결만으로는 부족하다. 만석이면 연결된 뒤 `ERR FULL`을 받기 때문 |
 | 포기 | `--max-retries N`회 연속 실패 시 종료 코드 3 (기본은 무한 재시도) | |
@@ -242,6 +258,8 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 | 슬롯 재사용 | `RobustnessIT.ReusedSlotStartsCleanAndOldClientGetsNothingMore`, `FramesQueuedForTheOldClientNeverReachTheNewOne` | 세대 번호 검증: 이전 클라이언트의 프레임과 카운터가 새 클라이언트에게 넘어가지 않음 |
 | 부분 전송 | `RobustnessIT.RepliesSurviveAClientThatPausesReading` | 읽기를 멈췄다 재개한 클라이언트가 응답을 빠짐없이 순서대로 받음 (`POLLOUT` 경로) |
 | 공정성 | `RobustnessIT.FloodOfRejectedConnections*`, `FloodingClientDoesNotStarveOtherClients` | 접속 폭주나 명령 폭주 중에도 다른 클라이언트의 최악 응답 200 ms 미만, 하트비트 유지 |
+| 장애 주입 | `tests/fault_test.py` | 실제 프로그램을 격리된 네트워크 네임스페이스에서 실행. 설정 파일 동작, fd 고갈, 서버 kill -9와 SIGSTOP, 랜선 단절(`iptables`), 손실·지연·순서 뒤바뀜·중복(`netem`) |
+| 명령 속도 제한 | `TokenBucket.*` (unit), `RobustnessIT.FloodIsLimitedToTheConfiguredRate`, `ThrottledClientKeepsReceivingEveryTrackFrame` 등 | 설정한 속도로 제한, 끊기거나 좀비로 오판되지 않음, 명령 유실·순서 변경 없음, 다른 클라이언트 영향 없음, **제한 중에도 트랙 프레임 손실 없음** |
 | 종료 | `RobustnessIT.StopUnderLoadNeverHangs` | 스트리밍 중, 긴 프레임 전송 중 `stop()` 12회 반복. 2초 안에 끝나고 모두 `BYE SHUTDOWN` 수신 |
 | 경쟁·입력·경로·설정 | `RobustnessIT.*` | 클라이언트 10개가 슬롯 3개 경쟁, 1바이트씩 전송, 한 패킷에 여러 명령, `QUIT` 뒤 명령, 바이너리 입력, 줄 길이 경계, 듣지 않는 UDP 포트, 스트리밍 중 포트 변경, 사용 중인 포트, `max_clients=64` |
 
@@ -250,7 +268,10 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 ## 8. 한계와 개선 여지
 
 - Linux 전용(POSIX). Windows 지원은 IO 스레드를 Asio로 바꾸거나 Winsock 분기 필요.
-- 어떤 바이트든 받으면 살아 있다고 보므로, 줄을 끝내지 않고 가끔 1바이트씩만 보내는 클라이언트(슬로우 로리스)는 줄 길이 제한에 걸릴 때까지 슬롯을 차지한다(기본값으로 3.5초마다 1바이트면 약 15분).
+- 살아 있지만 일을 하지 않는 클라이언트의 슬롯 점유는 막지 않는다. 좀비 판정은 "살아 있는가"만 묻기 때문이다.
+  - 줄을 끝내지 않고 가끔 1바이트씩 보내면(슬로우 로리스) 줄 길이 제한에 걸릴 때까지 슬롯을 차지한다(기본값으로 3.5초마다 1바이트면 약 15분).
+  - 빈 줄이나 `PONG`을 주기적으로 보내면 시간 제한 없이 슬롯을 차지한다(명령 속도 제한으로도 막히지 않는다. 초당 1개면 제한 안쪽이다). `REGISTER` 없이 하트비트에만 답하는 클라이언트도 마찬가지다.
+  - 판정 기준을 "완성된 줄 수신"으로 바꿔도 첫 번째 경우만 막힌다. 악의적인 점유까지 막으려면 인증이나 "일정 시간 안에 `START`하지 않으면 종료" 같은 별도 정책이 필요하며, 과제 범위 밖으로 두었다.
 - 접속 수가 커지면 `poll()` → `epoll`로, 슬롯당 Sender 스레드 → 고정 크기 Sender 풀로 바꾸는 것이 맞다.
 - 인증/암호화 없음. UDP 목적지는 TCP 접속 IP로 고정해 반사 공격만 막았다.
 - 테스트 환경 참고: GCC 11 TSan은 최신 WSL 커널에서 `setarch -R`이 필요하고, `pthread_cond_clockwait` 미지원으로 생기는 오탐 1종을 `tests/tsan.supp`에서 억제한다(data race 억제 아님).

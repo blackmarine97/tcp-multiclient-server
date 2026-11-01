@@ -23,6 +23,11 @@ std::optional<std::string> LineBuffer::next_line() {
     return line;
 }
 
+bool LineBuffer::has_line() const {
+    const auto pos = buf_.find('\n');
+    return pos != std::string::npos && pos <= max_line_;
+}
+
 void LineBuffer::clear() {
     buf_.clear();
     current_len_ = 0;

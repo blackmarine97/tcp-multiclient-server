@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,6 +23,7 @@ namespace radar {
 struct ServerStats {
     std::uint64_t accepted = 0;
     std::uint64_t rejected_full = 0;
+    std::uint64_t rejected_busy = 0;  // out of file descriptors
     std::uint64_t frames_produced = 0;
     std::uint64_t frames_dropped = 0;        // queue overflow, summed over all clients
     std::uint64_t stale_frames_skipped = 0;  // dequeued after STOP / slot reuse
@@ -41,6 +43,7 @@ struct SlotSnapshot {
     std::uint64_t fragments_sent = 0;
     std::uint64_t frames_dropped = 0;
     std::uint64_t send_errors = 0;
+    std::uint64_t throttle_events = 0;  // times the command rate limit paused this client
     std::size_t queue_depth = 0;
     std::size_t pending_output_bytes = 0;  // TCP replies the client has not taken yet
 };
@@ -91,8 +94,12 @@ private:
     void sender_loop(std::size_t index);
 
     void handle_accept(Clock::time_point now);
+    bool reject_without_fds();
+    void forgive_server_stall(Clock::time_point now);
     void handle_readable(std::size_t index, Clock::time_point now);
     void handle_line(std::size_t index, const std::string& line);
+    bool process_lines(std::size_t index, Clock::time_point now);
+    void resume_throttled(Clock::time_point now);
     void housekeeping(Clock::time_point now);
     void log_stats_report();
     int poll_timeout_ms(Clock::time_point now) const;
@@ -122,6 +129,7 @@ private:
     std::vector<std::thread> sender_threads_;
 
     std::atomic<std::size_t> active_{0};
+    std::atomic<std::uint64_t> rejected_busy_{0};
     std::atomic<std::uint64_t> accepted_{0}, rejected_full_{0}, frames_produced_{0}, frames_dropped_{0},
         stale_skipped_{0}, producer_overruns_{0};
     std::array<std::atomic<std::uint64_t>, kCloseReasonCount> closed_{};
@@ -129,7 +137,12 @@ private:
     mutable std::mutex period_mtx_;
     IntervalStats period_total_, period_window_;
 
-    Clock::time_point next_stats_report_{};  // io thread only
+    // ---- io thread only ----
+    Clock::time_point next_stats_report_{};
+    Clock::time_point last_io_round_{};
+    std::optional<Clock::time_point> accept_paused_until_;
+    bool accept_trouble_logged_ = false;
+    UniqueFd spare_fd_;  // given up to accept a connection when out of descriptors
 };
 
 }  // namespace radar

@@ -47,6 +47,7 @@ using Millis = std::chrono::milliseconds;
 // A server that accepts but never says WELCOME (e.g. frozen: the kernel still
 // completes the handshake) counts as lost after this long.
 constexpr Millis kWelcomeTimeout{5000};
+constexpr Millis kConnectTimeout{3000};
 
 volatile sig_atomic_t g_interrupted = 0;
 void on_sigint(int) { g_interrupted = 1; }
@@ -137,8 +138,23 @@ SessionEnd run_session(const Options& opt, const sockaddr_in& server, int udp, i
                        std::optional<Clock::time_point> deadline, radar::ReconnectBackoff& backoff,
                        Totals& totals) {
     radar::UniqueFd tcp(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
-    if (!tcp.valid() || ::connect(tcp.get(), reinterpret_cast<const sockaddr*>(&server), sizeof server) != 0) {
-        if (!g_interrupted && !opt.quiet) std::perror("connect");
+    if (!tcp.valid()) return SessionEnd::ConnectFailed;
+
+    // Without a limit connect() waits about 2 minutes when packets vanish, and a retry the
+    // kernel backed off to would keep waiting long after the network is back. SO_SNDTIMEO
+    // also applies to connect(), and stays useful for the sends that follow.
+    auto limit = kConnectTimeout;
+    if (deadline) limit = std::min(limit, std::max(Millis(1), std::chrono::ceil<Millis>(*deadline - Clock::now())));
+    timeval tv{};
+    tv.tv_sec = limit.count() / 1000;
+    tv.tv_usec = (limit.count() % 1000) * 1000;
+    ::setsockopt(tcp.get(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    if (::connect(tcp.get(), reinterpret_cast<const sockaddr*>(&server), sizeof server) != 0) {
+        if (!g_interrupted && !opt.quiet) {
+            if (errno == EINPROGRESS || errno == EAGAIN) std::cout << "connect: timed out" << std::endl;
+            else std::perror("connect");
+        }
         return SessionEnd::ConnectFailed;
     }
 
@@ -298,6 +314,7 @@ int main(int argc, char** argv) {
         if (g_interrupted || (deadline && Clock::now() >= *deadline)) break;
         if (opt.max_retries > 0 && backoff.failures() >= opt.max_retries) {
             std::cout << "GAVE UP after " << backoff.failures() << " retries" << std::endl;
+            totals.reasm.discard_pending();
             print_summary(totals);
             return 3;
         }
@@ -315,6 +332,7 @@ int main(int argc, char** argv) {
         if (g_interrupted || (deadline && Clock::now() >= *deadline)) break;
     }
 
+    totals.reasm.discard_pending();  // so "incomplete" also covers frames still waiting for fragments
     print_summary(totals);
     return 0;
 }

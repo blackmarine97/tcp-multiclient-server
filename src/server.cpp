@@ -17,6 +17,7 @@
 #include "line_buffer.hpp"
 #include "log.hpp"
 #include "protocol.hpp"
+#include "token_bucket.hpp"
 
 namespace radar {
 
@@ -32,13 +33,16 @@ constexpr int kListenBacklog = 16;
 constexpr int kMaxAcceptsPerRound = 16;
 constexpr int kMaxReadsPerRound = 4;
 
+constexpr Millis kAcceptPause{100};  // after an accept() failure that cannot be handled
+constexpr Millis kStallMargin{100};
+
 std::string errno_text(const char* what) { return std::string(what) + ": " + std::strerror(errno); }
 
 }  // namespace
 
 struct Server::Slot {
-    Slot(std::size_t queue_capacity, OverflowPolicy policy, std::size_t max_line)
-        : inbuf(max_line), queue(queue_capacity, policy) {}
+    Slot(std::size_t queue_capacity, OverflowPolicy policy, std::size_t max_line, std::size_t commands_per_sec)
+        : inbuf(max_line), command_limit(commands_per_sec), queue(queue_capacity, policy) {}
 
     // ---- io thread only ----
     int fd = -1;
@@ -46,6 +50,8 @@ struct Server::Slot {
     std::string outbuf;
     Clock::time_point connected_at{}, last_rx{}, last_hb{};
     std::uint32_t hb_seq = 0;
+    TokenBucket command_limit;
+    std::optional<Clock::time_point> throttled_until;  // not reading from this client until then
 
     // ---- shared, guarded by mtx ----
     // Held only for a few field accesses, never across a send, so the producer
@@ -65,7 +71,7 @@ struct Server::Slot {
 
     // ---- thread-safe ----
     BoundedQueue<FrameItem> queue;
-    std::atomic<std::uint64_t> frames_sent{0}, fragments_sent{0}, frames_dropped{0}, send_errors{0};
+    std::atomic<std::uint64_t> frames_sent{0}, fragments_sent{0}, frames_dropped{0}, send_errors{0}, throttle_events{0};
     std::atomic<std::size_t> pending_output{0};  // published copy of outbuf.size()
 };
 
@@ -110,11 +116,13 @@ bool Server::start(std::string* error) {
     socklen_t len = sizeof addr;
     ::getsockname(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), &len);
     bound_port_ = ntohs(addr.sin_port);
+    spare_fd_.reset(::open("/dev/null", O_RDONLY | O_CLOEXEC));
 
     slots_.clear();
     udp_fds_.clear();
     for (std::size_t i = 0; i < cfg_.max_clients; ++i) {
-        slots_.push_back(std::make_unique<Slot>(cfg_.queue_capacity, cfg_.queue_overflow, cfg_.max_line_bytes));
+        slots_.push_back(std::make_unique<Slot>(cfg_.queue_capacity, cfg_.queue_overflow, cfg_.max_line_bytes,
+                                                cfg_.max_commands_per_sec));
         UniqueFd udp(::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
         if (!udp.valid()) return fail(errno_text("udp socket"));
         udp_fds_.push_back(std::move(udp));
@@ -172,18 +180,23 @@ void Server::io_loop() {
     std::vector<pollfd> pfds;
     std::vector<int> owner;  // -2 wake pipe, -1 listen socket, >= 0 slot index
     next_stats_report_ = Clock::now() + cfg_.stats_interval;
+    last_io_round_ = Clock::now();
 
     while (!stop_.load()) {
+        resume_throttled(Clock::now());
+
         pfds.clear();
         owner.clear();
         pfds.push_back({wake_rd_.get(), POLLIN, 0});
         owner.push_back(-2);
-        pfds.push_back({listen_fd_.get(), POLLIN, 0});
+        if (accept_paused_until_ && Clock::now() >= *accept_paused_until_) accept_paused_until_.reset();
+        pfds.push_back({listen_fd_.get(), static_cast<short>(accept_paused_until_ ? 0 : POLLIN), 0});
         owner.push_back(-1);
         for (std::size_t i = 0; i < slots_.size(); ++i) {
             const Slot& s = *slots_[i];
             if (s.fd < 0) continue;
-            const short events = static_cast<short>(POLLIN | (s.outbuf.empty() ? 0 : POLLOUT));
+            // While throttled the socket is left unread, so TCP flow control slows the sender down.
+            const short events = static_cast<short>((s.throttled_until ? 0 : POLLIN) | (s.outbuf.empty() ? 0 : POLLOUT));
             pfds.push_back({s.fd, events, 0});
             owner.push_back(static_cast<int>(i));
         }
@@ -195,6 +208,7 @@ void Server::io_loop() {
             break;
         }
         const auto now = Clock::now();
+        forgive_server_stall(now);
 
         for (std::size_t k = 0; k < pfds.size() && rc > 0; ++k) {
             const short rev = pfds[k].revents;
@@ -216,6 +230,10 @@ void Server::io_loop() {
                 close_slot(i, CloseReason::Reset);
                 continue;
             }
+            if (s.throttled_until && (rev & (POLLHUP | POLLERR))) {  // gone: nothing left to wait for
+                close_slot(i, CloseReason::Reset);
+                continue;
+            }
             if (rev & (POLLIN | POLLHUP | POLLERR)) handle_readable(i, now);  // recv() reports EOF/errors
             if (s.fd >= 0 && (rev & POLLOUT) && !flush(i)) close_slot(i, CloseReason::Reset);
         }
@@ -226,14 +244,35 @@ void Server::io_loop() {
         if (slots_[i]->fd >= 0) close_slot(i, CloseReason::Shutdown, "BYE SHUTDOWN");
 }
 
+// With clients connected, poll() wakes up at least every heartbeat_interval. A longer gap
+// means this process did not run (SIGSTOP, VM pause, overloaded machine). During that time
+// no heartbeat went out, so clients had nothing to answer: their silence is the server's
+// fault and must not count against them.
+void Server::forgive_server_stall(Clock::time_point now) {
+    const auto gap = now - last_io_round_;
+    last_io_round_ = now;
+    if (gap <= cfg_.heartbeat_interval + kStallMargin) return;
+    bool any = false;
+    for (auto& sp : slots_) {
+        if (sp->fd < 0) continue;
+        sp->last_rx += gap;
+        any = true;
+    }
+    if (any)
+        log_msg(LogLevel::Warn, "server did not run for ", std::chrono::duration_cast<Millis>(gap).count(),
+                "ms; extending client timeouts by that much");
+}
+
 int Server::poll_timeout_ms(Clock::time_point now) const {
     std::optional<Clock::time_point> next;
     if (cfg_.stats_interval.count() > 0) next = next_stats_report_;
+    if (accept_paused_until_ && (!next || *accept_paused_until_ < *next)) next = accept_paused_until_;
     for (const auto& sp : slots_) {
         if (sp->fd < 0) continue;
         const auto d = next_liveness_deadline(sp->last_rx, sp->last_hb, cfg_.heartbeat_interval,
                                               cfg_.zombie_timeout);
         if (!next || d < *next) next = d;
+        if (sp->throttled_until && *sp->throttled_until < *next) next = sp->throttled_until;
     }
     if (!next) return -1;  // nothing scheduled: sleep until a socket or the wake pipe fires
     if (*next <= now) return 0;
@@ -249,9 +288,18 @@ void Server::handle_accept(Clock::time_point now) {
                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) log_msg(LogLevel::Warn, errno_text("accept"));
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            // The connection stays pending and poll() is level-triggered: without handling
+            // this, the loop would spin at full speed until something else frees resources.
+            if (!accept_trouble_logged_) log_msg(LogLevel::Warn, errno_text("accept"));
+            accept_trouble_logged_ = true;
+            if (errno == EMFILE || errno == ENFILE) {
+                if (reject_without_fds()) continue;
+            }
+            accept_paused_until_ = now + kAcceptPause;
             return;
         }
+        accept_trouble_logged_ = false;
 
         std::optional<std::size_t> free_index;
         for (std::size_t i = 0; i < slots_.size(); ++i) {
@@ -280,6 +328,9 @@ void Server::handle_accept(Clock::time_point now) {
         s.outbuf.clear();
         s.connected_at = s.last_rx = s.last_hb = now;
         s.hb_seq = 0;
+        s.command_limit.reset(now);
+        s.throttled_until.reset();
+        s.throttle_events = 0;
         s.frames_sent = 0;
         s.fragments_sent = 0;
         s.frames_dropped = 0;
@@ -301,6 +352,23 @@ void Server::handle_accept(Clock::time_point now) {
     }
 }
 
+// Out of file descriptors: a descriptor kept in reserve makes it possible to take the
+// pending connection off the queue and tell the client, instead of leaving it hanging.
+bool Server::reject_without_fds() {
+    if (!spare_fd_.valid()) return false;
+    spare_fd_.reset();
+    const int fd = ::accept4(listen_fd_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd >= 0) {
+        ++rejected_busy_;
+        static constexpr char kBusy[] = "ERR BUSY\n";
+        [[maybe_unused]] auto n = ::send(fd, kBusy, sizeof kBusy - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+        ::shutdown(fd, SHUT_WR);
+        ::close(fd);
+    }
+    spare_fd_.reset(::open("/dev/null", O_RDONLY | O_CLOEXEC));
+    return fd >= 0;
+}
+
 void Server::handle_readable(std::size_t i, Clock::time_point now) {
     Slot& s = *slots_[i];
     char buf[kRecvChunk];
@@ -309,15 +377,7 @@ void Server::handle_readable(std::size_t i, Clock::time_point now) {
         if (n > 0) {
             s.last_rx = now;  // any byte proves the peer is alive
             s.inbuf.append(buf, static_cast<std::size_t>(n));
-            while (auto line = s.inbuf.next_line()) {  // commands before a bad line are valid
-                handle_line(i, *line);
-                if (s.fd < 0) return;  // QUIT or a failed write closed the slot
-            }
-            if (s.inbuf.overflowed()) {
-                queue_line(i, "ERR LINE_TOO_LONG");
-                close_slot(i, CloseReason::Protocol);
-                return;
-            }
+            if (!process_lines(i, now)) return;
             continue;
         }
         if (n == 0) {
@@ -329,6 +389,37 @@ void Server::handle_readable(std::size_t i, Clock::time_point now) {
         log_msg(LogLevel::Info, "slot ", i, " ", errno_text("recv"));
         close_slot(i, CloseReason::Reset);
         return;
+    }
+}
+
+// Runs the buffered commands the rate limit allows. Returns false when reading from this
+// client must stop for now: it was throttled, or the slot was closed.
+bool Server::process_lines(std::size_t i, Clock::time_point now) {
+    Slot& s = *slots_[i];
+    while (s.inbuf.has_line()) {
+        if (!s.command_limit.try_take(now)) {
+            s.throttled_until = s.command_limit.next_available(now);
+            ++s.throttle_events;
+            return false;
+        }
+        s.last_rx = now;  // a queued command is as good as a new byte: throttling is not silence
+        handle_line(i, *s.inbuf.next_line());
+        if (s.fd < 0) return false;  // QUIT or a failed write closed the slot
+    }
+    if (s.inbuf.overflowed()) {  // only after the valid commands in front of the bad line
+        queue_line(i, "ERR LINE_TOO_LONG");
+        close_slot(i, CloseReason::Protocol);
+        return false;
+    }
+    return true;
+}
+
+void Server::resume_throttled(Clock::time_point now) {
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        Slot& s = *slots_[i];
+        if (s.fd < 0 || !s.throttled_until || now < *s.throttled_until) continue;
+        s.throttled_until.reset();
+        process_lines(i, now);
     }
 }
 
@@ -434,7 +525,8 @@ std::string Server::status_line(std::size_t i) const {
            " fragments_sent=" + std::to_string(s.fragments_sent.load()) +
            " dropped=" + std::to_string(s.frames_dropped.load()) +
            " send_errors=" + std::to_string(s.send_errors.load()) +
-           " queue=" +std::to_string(s.queue.size()) + "/" + std::to_string(s.queue.capacity());
+           " throttled=" + std::to_string(s.throttle_events.load()) +
+           " queue=" + std::to_string(s.queue.size()) + "/" + std::to_string(s.queue.capacity());
 }
 
 bool Server::queue_line(std::size_t i, const std::string& line) {
@@ -624,6 +716,7 @@ std::vector<SlotSnapshot> Server::snapshot() const {
         snap.fragments_sent = s.fragments_sent.load();
         snap.frames_dropped = s.frames_dropped.load();
         snap.send_errors = s.send_errors.load();
+        snap.throttle_events = s.throttle_events.load();
         snap.queue_depth = s.queue.size();
         snap.pending_output_bytes = s.pending_output.load();
         out.push_back(std::move(snap));
@@ -635,6 +728,7 @@ ServerStats Server::stats() const {
     ServerStats st;
     st.accepted = accepted_.load();
     st.rejected_full = rejected_full_.load();
+    st.rejected_busy = rejected_busy_.load();
     st.frames_produced = frames_produced_.load();
     st.frames_dropped = frames_dropped_.load();
     st.stale_frames_skipped = stale_skipped_.load();
@@ -671,6 +765,7 @@ std::vector<std::string> format_stats_report(const ServerStats& stats, const std
                     " produced=" + std::to_string(stats.frames_produced) +
                     " dropped=" + std::to_string(stats.frames_dropped) +
                     " rejected_full=" + std::to_string(stats.rejected_full) +
+                    " rejected_busy=" + std::to_string(stats.rejected_busy) +
                     " overruns=" + std::to_string(stats.producer_overruns) + " " + period);
     for (const auto& s : slots) {
         if (s.state == SlotState::Free) continue;
@@ -678,7 +773,7 @@ std::vector<std::string> format_stats_report(const ServerStats& stats, const std
                         " udp_port=" + std::to_string(s.udp_port) + " frames_sent=" + std::to_string(s.frames_sent) +
                         " fragments_sent=" + std::to_string(s.fragments_sent) +
                         " dropped=" + std::to_string(s.frames_dropped) + " send_errors=" + std::to_string(s.send_errors) +
-                        " queue=" + std::to_string(s.queue_depth) +
+                        " throttled=" + std::to_string(s.throttle_events) + " queue=" + std::to_string(s.queue_depth) +
                         " pending_output=" + std::to_string(s.pending_output_bytes));
     }
     return lines;

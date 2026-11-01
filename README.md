@@ -55,6 +55,7 @@ Config file [config/server.conf](config/server.conf):
 | `max_datagram_bytes` | 512 | Maximum UDP fragment size (64 tracks → 4 fragments) |
 | `max_line_bytes` | 256 | Maximum length of one command line |
 | `stats_interval_ms` | 5000 | Periodic stats log (needs `log_level = info`); 0 = off |
+| `max_commands_per_sec` | 100 | Per-client TCP command limit, bursts up to the same number; 0 = off. Does not affect the UDP track stream |
 | `log_level` | info | debug / info / warn / error / off |
 
 ### Client
@@ -69,8 +70,8 @@ and frames). It runs until Ctrl+C or for `--duration-ms N`:
 Options: `--host`, `--udp-port`, `--duration-ms N` (0 = run until Ctrl+C), `--no-pong` (behave like a zombie),
 `--no-start`, `--quiet`, `--reconnect-min-ms N`, `--reconnect-max-ms N`, `--max-retries N`.
 
-The client always reconnects, with no option needed. It retries after a lost connection, a refused connection,
-`ERR FULL`, or a server that has gone silent (no data within the `timeout_ms` announced in `WELCOME`). Delays
+The client always reconnects, with no option needed. It retries after a lost connection, a refused connection or
+one that takes over 3 s, `ERR FULL`, `ERR BUSY`, or a server that has gone silent (no data within the `timeout_ms` announced in `WELCOME`). Delays
 double from `--reconnect-min-ms` (default 1000) up to `--reconnect-max-ms` (default 8000), plus up to 25% random
 jitter. Each new connection sends `REGISTER` and `START` again on the same UDP port, and the `SUMMARY` totals
 cover the whole run. `--max-retries N` gives up with exit code 3 after N consecutive failures (default 0 = never).
@@ -90,7 +91,7 @@ OK STREAMING
 HB 1
 PONG 1
 STATUS
-OK STATUS slot=0 state=STREAMING udp_port=5000 frames_sent=61 fragments_sent=244 dropped=0 send_errors=0 queue=0/8
+OK STATUS slot=0 state=STREAMING udp_port=5000 frames_sent=61 fragments_sent=244 dropped=0 send_errors=0 throttled=0 queue=0/8
 QUIT
 BYE
 ```
@@ -106,12 +107,16 @@ Each command is one line of text ending in `\n` (`\r\n` is accepted; keywords ar
 | `STOP` | `OK STOPPED` / `ERR NOT_REGISTERED` | Pause streaming; no datagram is sent after this reply |
 | `PING [token]` | `PONG [token]` | Liveness/RTT check from the client side |
 | `PONG [seq]` | (none) | Answer to the server's `HB <seq>` heartbeat |
-| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= send_errors= queue=` | Per-client state and counters |
+| `STATUS` | `OK STATUS slot= state= udp_port= frames_sent= fragments_sent= dropped= send_errors= throttled= queue=` | Per-client state and counters |
 | `QUIT` | `BYE`, then the connection closes | Graceful disconnect |
+
+Each client may send `max_commands_per_sec` commands per second (default 100), with bursts up to the same number. A
+client above that is not disconnected and its commands are not lost: the server stops reading from it for a moment,
+so its commands are answered later. Only TCP commands are limited; track frames keep arriving over UDP as usual.
 
 Errors: `ERR UNKNOWN_COMMAND <word>`, `ERR BAD_ARGUMENT <reason>` (connection stays open),
 `ERR LINE_TOO_LONG` (connection closed). Server-initiated lines: `WELCOME ...` on connect, `ERR FULL` when
-all slots are taken, `HB <seq>` every heartbeat, `BYE TIMEOUT` for a zombie, `BYE SHUTDOWN` on server exit.
+all slots are taken, `HB <seq>` every heartbeat, `BYE TIMEOUT` for a zombie, `BYE SHUTDOWN` on server exit, and `ERR BUSY` when the server is out of file descriptors.
 The full protocol is in DESIGN.md §6.
 
 ### Measurements
@@ -119,8 +124,8 @@ The full protocol is in DESIGN.md §6.
 The server logs a report every `stats_interval_ms`, including the measured frame period:
 
 ```text
-stats: clients=1/3 produced=58 dropped=0 rejected_full=0 overruns=0 period_ms avg=35.00 min=34.85 max=35.13 jitter=0.03
-stats: slot 0 STREAMING peer=127.0.0.1:34142 udp_port=49649 frames_sent=52 fragments_sent=208 dropped=0 send_errors=0 queue=0 pending_output=0
+stats: clients=1/3 produced=58 dropped=0 rejected_full=0 rejected_busy=0 overruns=0 period_ms avg=35.00 min=34.85 max=35.13 jitter=0.03
+stats: slot 0 STREAMING peer=127.0.0.1:34142 udp_port=49649 frames_sent=52 fragments_sent=208 dropped=0 send_errors=0 throttled=0 queue=0 pending_output=0
 ```
 
 The client reports loss and latency in its `STATS` and `SUMMARY` lines:
@@ -146,7 +151,7 @@ bash scripts/demo.sh build
 
 ```bash
 cd build
-ctest --output-on-failure          # everything (59 unit + 50 integration)
+ctest --output-on-failure          # everything (66 unit + 56 integration)
 ctest -L unit                       # unit tests only
 ctest -L integration                # integration tests only
 ./integration_tests --gtest_filter='*Kill*'   # a single test (prints its measurements)
@@ -171,7 +176,8 @@ Beyond the assignment:
   backlog limit rather than the heartbeat timer.
 - `ServerIT.FramePeriodIsCloseToConfigured`: the measured frame period.
 - `RobustnessIT.*`: connection churn with fd and slot accounting, repeated kill -9, slot reuse, replies surviving a
-  client that pauses reading, stopping under load, floods that must not starve other clients, 10 clients competing
+  client that pauses reading, stopping under load, floods that must not starve other clients, the command rate limit
+  (including that a throttled client still receives every track frame), 10 clients competing
   for 3 slots, input edge cases, UDP path changes, and configuration limits.
 
 Sample output from `./integration_tests`:
@@ -208,6 +214,22 @@ SIGINT. It exits with code 0 when everything passes.
 21/21 checks passed
 ```
 
+### Fault injection
+
+```bash
+python3 tests/fault_test.py build
+```
+
+Runs the real binaries in a private network namespace (`unshare -Urn`), so it needs no sudo, never touches the
+machine's real network, and always has port 8088 free. It needs `iproute2` and `iptables`, and is not part of CI
+because hosted runners may not allow user namespaces. It checks:
+
+- settings really coming from the config file, and start-up errors
+- running out of file descriptors (`ulimit`)
+- the server being killed with kill -9, and being frozen with SIGSTOP
+- a cable cut (`iptables`): packets vanish and nobody receives a FIN
+- packet loss, delay, reordering and duplicates (`tc netem`)
+
 ### Sanitizers
 
 ```bash
@@ -235,6 +257,7 @@ src/
   bounded_queue.hpp      bounded queue (drop_oldest / drop_newest, drop counting)
   liveness.hpp           zombie rule
   backoff.hpp            reconnect delay (used by radar_client)
+  token_bucket.hpp       per-client command rate limit
   interval_stats.hpp     measured frame period
   stream_stats.hpp       client-side loss and latency
   slot.hpp               slot states, close reasons
@@ -247,6 +270,7 @@ tools/radar_client.cpp   demo / test client
 tests/unit/              unit tests
 tests/integration/       integration tests (real sockets, real child processes)
 tests/smoke_test.py      Python smoke test (black-box test of the built binaries)
+tests/fault_test.py      Python fault injection (fd limits, server failures, cable cut, netem)
 config/server.conf       default config
 scripts/demo.sh          end-to-end demo
 docs/DESIGN.md           design document (Korean)

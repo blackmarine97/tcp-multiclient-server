@@ -6,6 +6,7 @@
 #include "interval_stats.hpp"
 #include "server.hpp"
 #include "stream_stats.hpp"
+#include "token_bucket.hpp"
 
 using namespace radar;
 
@@ -121,6 +122,58 @@ TEST(StatsReport, ServerLineAndOneLinePerOccupiedSlot) {
     EXPECT_NE(lines[0].find("avg=35.00"), std::string::npos) << lines[0];
     EXPECT_NE(lines[1].find("slot 1 STREAMING"), std::string::npos) << lines[1];
     EXPECT_NE(lines[1].find("frames_sent=93"), std::string::npos) << lines[1];
+}
+
+TEST(TokenBucket, AllowsABurstThenTheRate) {
+    TokenBucket b(100);
+    const Clock::time_point t0{};
+    b.reset(t0);
+    for (int i = 0; i < 100; ++i) EXPECT_TRUE(b.try_take(t0)) << i;
+    EXPECT_FALSE(b.try_take(t0));
+
+    EXPECT_FALSE(b.try_take(t0 + std::chrono::milliseconds(5)));
+    EXPECT_TRUE(b.try_take(t0 + std::chrono::milliseconds(10)));  // 100/s = one per 10 ms
+    EXPECT_FALSE(b.try_take(t0 + std::chrono::milliseconds(10)));
+}
+
+TEST(TokenBucket, IdleTimeDoesNotBuildUpMoreThanOneBurst) {
+    TokenBucket b(10);
+    const Clock::time_point t0{};
+    b.reset(t0);
+    const auto later = t0 + std::chrono::hours(1);
+    for (int i = 0; i < 10; ++i) EXPECT_TRUE(b.try_take(later)) << i;
+    EXPECT_FALSE(b.try_take(later));
+}
+
+TEST(TokenBucket, NextAvailableIsWhenATokenExists) {
+    TokenBucket b(100);
+    const Clock::time_point t0{};
+    b.reset(t0);
+    EXPECT_EQ(b.next_available(t0), t0);
+    for (int i = 0; i < 100; ++i) b.try_take(t0);
+    const auto at = b.next_available(t0);
+    EXPECT_GT(at, t0);
+    EXPECT_TRUE(b.try_take(at));
+}
+
+TEST(TokenBucket, ZeroMeansUnlimited) {
+    TokenBucket b(0);
+    const Clock::time_point t0{};
+    b.reset(t0);
+    for (int i = 0; i < 100000; ++i) ASSERT_TRUE(b.try_take(t0));
+}
+
+TEST(Config, CommandLimitMustLeaveRoomForHeartbeats) {
+    std::string err;
+    std::istringstream too_low("max_commands_per_sec = 1\nheartbeat_interval_ms = 1000\n");
+    EXPECT_FALSE(parse_config(too_low, &err));
+    EXPECT_NE(err.find("max_commands_per_sec"), std::string::npos) << err;
+
+    std::istringstream enough("max_commands_per_sec = 2\nheartbeat_interval_ms = 1000\n");
+    EXPECT_TRUE(parse_config(enough, &err)) << err;
+
+    std::istringstream off("max_commands_per_sec = 0\n");
+    EXPECT_TRUE(parse_config(off, &err)) << err;
 }
 
 TEST(Config, StatsInterval) {

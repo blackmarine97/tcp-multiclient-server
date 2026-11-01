@@ -556,6 +556,7 @@ TEST_F(ServerIT, StopTakesEffectInTheMiddleOfALongFrame) {
 // A client that keeps sending but stops reading never looks dead to the heartbeat
 // check (bytes keep arriving), so only the output backlog limit can catch it.
 TEST_F(ServerIT, ClientThatStopsReadingIsReapedAsStalled) {
+    cfg.max_commands_per_sec = 0;  // about output backlog, not about the rate limit
     cfg.max_line_bytes = 60000;    // lets PING produce large replies
     cfg.heartbeat_interval = 10s;  // no help from the timer...
     cfg.zombie_timeout = 30s;      // ...this has to be the backlog check

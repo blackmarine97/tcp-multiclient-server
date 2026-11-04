@@ -28,6 +28,8 @@ struct TrackFrame {
     std::vector<Track> tracks;
 };
 inline constexpr std::size_t kFrameHeaderWireSize = 16;  // seq u32, timestamp u64, count u32
+inline constexpr std::size_t kMaxTracksPerFrame = 10000;
+inline constexpr std::size_t kMaxFrameBytes = kFrameHeaderWireSize + kMaxTracksPerFrame * kTrackWireSize;
 
 // Deterministic fake radar: N targets moving in range and rotating in azimuth.
 class FakeTrackGenerator {
@@ -54,6 +56,7 @@ std::optional<TrackFrame> deserialize_frame(const std::uint8_t* data, std::size_
 //   total_size u32   | offset u32
 inline constexpr std::uint32_t kFragmentMagic = 0x31524452;  // bytes 'R','D','R','1'
 inline constexpr std::size_t kFragmentHeaderSize = 20;
+inline constexpr std::size_t kMaxFragmentsPerFrame = 65535;  // frag_count is a u16
 
 struct FragmentHeader {
     std::uint32_t frame_seq = 0;
@@ -62,11 +65,14 @@ struct FragmentHeader {
     std::uint32_t total_size = 0;
     std::uint32_t offset = 0;
     std::size_t payload_len = 0;
+    std::size_t chunk = 0;  // bytes in every fragment of this frame but the last
 };
 
 std::size_t fragment_count_for(std::size_t payload_size, std::size_t max_datagram);
 std::vector<std::vector<std::uint8_t>> fragment_payload(const std::vector<std::uint8_t>& payload,
                                                         std::uint32_t frame_seq, std::size_t max_datagram);
+// Rejects any header fragment_payload() could not have written. Anyone can send UDP to the
+// receiver, so total_size must not be trusted before it is used to allocate.
 std::optional<FragmentHeader> parse_fragment(const std::uint8_t* data, std::size_t len);
 
 // A frame serialized and cut into datagrams once, then shared (read-only) by every client queue.
@@ -102,6 +108,7 @@ private:
     struct Partial {
         std::vector<std::uint8_t> data;
         std::vector<bool> have;
+        std::size_t chunk = 0;
         std::uint16_t received = 0;
     };
     std::size_t max_pending_;

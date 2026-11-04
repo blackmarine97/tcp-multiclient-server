@@ -16,10 +16,12 @@ class StreamStats {
 public:
     void on_frame(std::uint32_t seq, std::uint64_t sent_us, std::uint64_t received_us) {
         ++received_;
+        // Unsigned subtraction read as signed keeps the order right when seq wraps around.
+        const auto ahead = last_seq_ ? static_cast<std::int32_t>(seq - *last_seq_) : 1;
         if (!last_seq_) {
             last_seq_ = seq;
-        } else if (seq > *last_seq_) {
-            lost_ += seq - *last_seq_ - 1;
+        } else if (ahead > 0) {
+            lost_ += static_cast<std::uint32_t>(ahead) - 1;
             last_seq_ = seq;
         } else {  // arrived after a newer frame: it was late, not lost
             ++reordered_;

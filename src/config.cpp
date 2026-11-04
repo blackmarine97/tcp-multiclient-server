@@ -91,7 +91,7 @@ std::optional<Config> parse_config(std::istream& in, std::string* error) {
             else if (value == "drop_newest") cfg.queue_overflow = OverflowPolicy::DropNewest;
             else return fail("queue_overflow must be drop_oldest or drop_newest");
         } else if (key == "tracks_per_frame") {
-            if (!need_uint(0, 10000)) return fail(range_msg(0, 10000));
+            if (!need_uint(0, kMaxTracksPerFrame)) return fail(range_msg(0, kMaxTracksPerFrame));
             cfg.tracks_per_frame = n;
         } else if (key == "max_datagram_bytes") {
             if (!need_uint(kFragmentHeaderSize + 1, 65507)) return fail(range_msg(kFragmentHeaderSize + 1, 65507));
@@ -135,6 +135,12 @@ std::string validate_config(const Config& cfg) {
         return "zombie_timeout_ms must be greater than heartbeat_interval_ms";
     if (cfg.max_datagram_bytes <= kFragmentHeaderSize)
         return "max_datagram_bytes must be larger than the fragment header";
+    if (cfg.tracks_per_frame > kMaxTracksPerFrame)
+        return "tracks_per_frame is above the " + std::to_string(kMaxTracksPerFrame) + " a client accepts";
+    if (fragment_count_for(kFrameHeaderWireSize + cfg.tracks_per_frame * kTrackWireSize, cfg.max_datagram_bytes) >
+        kMaxFragmentsPerFrame)
+        return "tracks_per_frame and max_datagram_bytes give more than " + std::to_string(kMaxFragmentsPerFrame) +
+               " fragments per frame";
     // Heartbeat answers are commands too: the limit must leave room for them, or a
     // healthy client would fall behind and be declared a zombie.
     if (cfg.max_commands_per_sec > 0 &&

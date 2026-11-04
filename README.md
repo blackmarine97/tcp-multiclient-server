@@ -51,8 +51,8 @@ Config file [config/server.conf](config/server.conf):
 | `zombie_timeout_ms` | 3500 | A client that sends nothing for this long is a zombie |
 | `queue_capacity` | 8 | Per-client frame queue size |
 | `queue_overflow` | drop_oldest | When the queue is full: `drop_oldest` / `drop_newest` |
-| `tracks_per_frame` | 64 | Tracks per frame |
-| `max_datagram_bytes` | 512 | Maximum UDP fragment size (64 tracks → 4 fragments) |
+| `tracks_per_frame` | 64 | Tracks per frame (up to 10000) |
+| `max_datagram_bytes` | 512 | Maximum UDP fragment size (64 tracks → 4 fragments; one frame may use at most 65535 fragments) |
 | `max_line_bytes` | 256 | Maximum length of one command line |
 | `stats_interval_ms` | 5000 | Periodic stats log (needs `log_level = info`); 0 = off |
 | `max_commands_per_sec` | 100 | Per-client TCP command limit, bursts up to the same number; 0 = off. Does not affect the UDP track stream |
@@ -179,6 +179,9 @@ Beyond the assignment:
   client that pauses reading, stopping under load, floods that must not starve other clients, the command rate limit
   (including that a throttled client still receives every track frame), 10 clients competing
   for 3 slots, input edge cases, UDP path changes, and configuration limits.
+- `ForgedFragment.*`: UDP datagrams with a huge `total_size` or a header that would leave holes are rejected without
+  allocating, and valid frames of every size still get through.
+- `*Wraparound*`: frame numbers wrapping from 0xFFFFFFFF to 0.
 
 Sample output from `./integration_tests`:
 
@@ -199,10 +202,11 @@ Python 3 standard library.
 python3 tests/smoke_test.py build
 ```
 
-It checks 21 items in order: basic commands → 4th connection rejected → 3 concurrent streams (fragments
+It checks 24 items in order: basic commands → 4th connection rejected → 3 concurrent streams (fragments
 received = fragments the server sent) → slot reclaimed after a `radar_client` process is killed with
-kill -9 → a client that ignores heartbeats is reaped while healthy clients stay → graceful shutdown on
-SIGINT. It exits with code 0 when everything passes.
+kill -9 → a client that ignores heartbeats is reaped while healthy clients stay → forged UDP datagrams
+leave `radar_client` running with its memory unchanged → graceful shutdown on SIGINT. It exits with code 0
+when everything passes.
 
 ```text
 3. 3 clients streaming
@@ -211,7 +215,7 @@ SIGINT. It exits with code 0 when everything passes.
 5. zombie: client that never answers heartbeats
   [PASS] zombie gets BYE TIMEOUT  (after 801 ms)
 ...
-21/21 checks passed
+24/24 checks passed
 ```
 
 ### Fault injection

@@ -23,6 +23,16 @@ TEST(Config, EmptyFileGivesDefaults) {
     EXPECT_EQ(c->queue_overflow, OverflowPolicy::DropOldest);
 }
 
+TEST(Config, FrameMustFitInTheFragmentCountField) {
+    std::string err;
+    // 1 payload byte per datagram: the fragment count equals the frame size.
+    EXPECT_TRUE(parse("tracks_per_frame = 2729\nmax_datagram_bytes = 21\n", &err)) << err;  // 65512
+    EXPECT_FALSE(parse("tracks_per_frame = 2730\nmax_datagram_bytes = 21\n", &err));        // 65536
+    EXPECT_NE(err.find("fragments"), std::string::npos) << err;
+    EXPECT_FALSE(parse("tracks_per_frame = 10000\nmax_datagram_bytes = 21\n"));
+    EXPECT_TRUE(parse("tracks_per_frame = 10000\nmax_datagram_bytes = 512\n"));
+}
+
 TEST(Config, ParsesKeysCommentsAndWhitespace) {
     auto c = parse(
         "# comment\n"

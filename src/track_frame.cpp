@@ -148,8 +148,23 @@ std::optional<FragmentHeader> parse_fragment(const std::uint8_t* data, std::size
     h.total_size = get_u32(data + 12);
     h.offset = get_u32(data + 16);
     h.payload_len = len - kFragmentHeaderSize;
-    if (h.count == 0 || h.index >= h.count) return std::nullopt;
-    if (static_cast<std::uint64_t>(h.offset) + h.payload_len > h.total_size) return std::nullopt;
+    if (h.count == 0 || h.index >= h.count || h.total_size > kMaxFrameBytes) return std::nullopt;
+
+    if (h.count == 1) {
+        if (h.offset != 0 || h.payload_len != h.total_size) return std::nullopt;
+        h.chunk = h.payload_len;
+        return h;
+    }
+
+    // Equal chunks and a shorter (or equal) last one: together with a chunk size shared by the
+    // whole frame, this leaves no way to overlap or leave a hole.
+    const bool last = h.index + 1 == h.count;
+    if (last && h.offset % h.index != 0) return std::nullopt;
+    const std::uint64_t chunk = last ? h.offset / h.index : h.payload_len;
+    if (chunk == 0 || h.offset != h.index * chunk) return std::nullopt;
+    if (h.total_size <= (h.count - 1) * chunk || h.total_size > h.count * chunk) return std::nullopt;
+    if (h.payload_len != (last ? h.total_size - h.offset : chunk)) return std::nullopt;
+    h.chunk = static_cast<std::size_t>(chunk);
     return h;
 }
 
@@ -179,16 +194,20 @@ std::optional<std::vector<std::uint8_t>> FrameReassembler::add(const std::uint8_
     auto it = pending_.find(h->frame_seq);
     if (it == pending_.end()) {
         if (pending_.size() >= max_pending_) {  // give up on the oldest incomplete frame
-            pending_.erase(pending_.begin());
+            // By frame number, not map order: after a wraparound frame 0 is newer than 0xFFFFFFFF.
+            pending_.erase(std::min_element(pending_.begin(), pending_.end(), [](const auto& a, const auto& b) {
+                return static_cast<std::int32_t>(a.first - b.first) < 0;
+            }));
             ++abandoned_;
         }
         Partial p;
         p.data.resize(h->total_size);
         p.have.assign(h->count, false);
+        p.chunk = h->chunk;
         it = pending_.emplace(h->frame_seq, std::move(p)).first;
     }
     Partial& p = it->second;
-    if (p.have.size() != h->count || p.data.size() != h->total_size) {
+    if (p.have.size() != h->count || p.data.size() != h->total_size || p.chunk != h->chunk) {
         ++invalid_;
         return std::nullopt;
     }
@@ -196,7 +215,7 @@ std::optional<std::vector<std::uint8_t>> FrameReassembler::add(const std::uint8_
         ++duplicates_;
         return std::nullopt;
     }
-    std::memcpy(p.data.data() + h->offset, data + kFragmentHeaderSize, h->payload_len);
+    if (h->payload_len > 0) std::memcpy(p.data.data() + h->offset, data + kFragmentHeaderSize, h->payload_len);
     p.have[h->index] = true;
     if (++p.received < h->count) return std::nullopt;
 

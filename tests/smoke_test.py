@@ -255,7 +255,38 @@ def main():
             o.send("PING alive")
             check("healthy client survived", o.reply() == "PONG alive")
 
-        print("\n6. SIGINT -> graceful shutdown")
+        print("\n6. forged UDP datagrams -> radar_client keeps its memory")
+        target = subprocess.Popen([CLIENT_BIN, "--port", str(port)], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True)
+        ready = ""
+        for _ in range(10):
+            ready = target.stdout.readline()
+            if not ready or ready.startswith("READY"):
+                break
+        udp_port = int(re.search(r"udp_port=(\d+)", ready).group(1))
+
+        def rss_kb():
+            with open(f"/proc/{target.pid}/status") as f:
+                return int(re.search(r"VmRSS:\s+(\d+)", f.read()).group(1))
+
+        before = rss_kb()
+        forger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for i in range(40):  # each claims to start a 64 MB frame
+            forger.sendto(FRAG_HEADER.pack(FRAG_MAGIC, 1000000 + i, 0, 2, 64 << 20, 0) + b"\0" * 100,
+                          ("127.0.0.1", udp_port))
+        forger.close()
+        time.sleep(0.3)
+        growth_mb = (rss_kb() - before) / 1024
+        check("memory did not grow", growth_mb < 50, f"{growth_mb:.1f} MB")
+        check("radar_client still running", target.poll() is None)
+        target.send_signal(signal.SIGINT)
+        out = target.communicate(timeout=5)[0]
+        summary = re.search(r"SUMMARY .*frames=(\d+).* invalid=(\d+)", out)
+        check("forged datagrams counted as invalid, real frames still arrive",
+              bool(summary) and int(summary.group(2)) >= 40 and int(summary.group(1)) > 0,
+              summary.group(0) if summary else "no SUMMARY")
+
+        print("\n7. SIGINT -> graceful shutdown")
         server.send_signal(signal.SIGINT)
         for o in others:
             check("client gets BYE SHUTDOWN", o.reply() == "BYE SHUTDOWN")

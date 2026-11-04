@@ -209,6 +209,16 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 기본 64 트랙 = 1552 바이트 → 조각 4개/프레임. 수신 측 `FrameReassembler`가 순서 무관 재조립, 중복 무시, 오래된 미완성 프레임 폐기를 담당한다.
 기본값 512는 조각화 동작을 보여주기 위한 값이며, 실제 망에서는 IP 단편화를 피하는 ~1400이 적절하다.
 
+UDP는 누구나 보낼 수 있으므로 수신 측은 헤더를 믿지 않고, 송신 측이 쓸 수 없는 조각을 `invalid`로 버린다.
+
+| 검사 | 막는 것 |
+|---|---|
+| `total_size` ≤ 240,016 바이트 (트랙 10,000개 프레임) | 20바이트 패킷 하나로 수 GB를 할당시키는 공격. 수신 측 메모리는 최대 대기 프레임 수 × 240 KB로 제한된다 |
+| `offset` = `index` × 조각 크기, 마지막 조각은 `total_size`에서 끝남, 같은 프레임은 조각 크기가 같음 | 겹치거나 구멍 난 데이터가 완성 프레임으로 처리되는 것 |
+
+`frag_count`가 16비트이므로 프레임당 조각이 65,535개를 넘는 설정(`tracks_per_frame`, `max_datagram_bytes` 조합)은 서버 시작 시 거부한다.
+`frame_seq`는 약 4.8년(35 ms × 2³²) 뒤 한 바퀴 돌 수 있어, 앞뒤 판단은 값 크기가 아니라 부호 있는 차이로 한다.
+
 ### 클라이언트 재연결 (`radar_client` 기본 동작)
 
 과제 요구사항은 아니지만 추가한 기능으로, 옵션 없이 항상 동작한다. **서버는 바꾸지 않고 클라이언트에만** 구현했다. 서버에게 재접속은 새 클라이언트와 같다.
@@ -258,6 +268,9 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
 | 슬롯 재사용 | `RobustnessIT.ReusedSlotStartsCleanAndOldClientGetsNothingMore`, `FramesQueuedForTheOldClientNeverReachTheNewOne` | 세대 번호 검증: 이전 클라이언트의 프레임과 카운터가 새 클라이언트에게 넘어가지 않음 |
 | 부분 전송 | `RobustnessIT.RepliesSurviveAClientThatPausesReading` | 읽기를 멈췄다 재개한 클라이언트가 응답을 빠짐없이 순서대로 받음 (`POLLOUT` 경로) |
 | 공정성 | `RobustnessIT.FloodOfRejectedConnections*`, `FloodingClientDoesNotStarveOtherClients` | 접속 폭주나 명령 폭주 중에도 다른 클라이언트의 최악 응답 200 ms 미만, 하트비트 유지 |
+| 위조 UDP 조각 | `ForgedFragment.*` (unit), `tests/smoke_test.py` 6번 | 거대한 `total_size`, 구멍이나 겹침을 만드는 헤더가 메모리 할당이나 완성 프레임으로 이어지지 않음. 실제 `radar_client`에 위조 패킷을 보내도 메모리가 늘지 않고 진짜 프레임은 계속 수신 |
+| 조각 왕복 | `Fragmentation.EveryPayloadAndDatagramSizeRoundTrips`, `TheLargestFrameTheServerCanSendStillGetsThrough` | 검증이 정상 프레임을 잘못 거부하지 않음 |
+| 번호 순환 | `StreamStats.*Wraparound*`, `Fragmentation.OldestFrameIsAbandonedAcrossSequenceWraparound` | `seq`가 0으로 돌아가도 손실·순서 집계와 미완성 프레임 폐기가 맞음 |
 | 장애 주입 | `tests/fault_test.py` | 실제 프로그램을 격리된 네트워크 네임스페이스에서 실행. 설정 파일 동작, fd 고갈, 서버 kill -9와 SIGSTOP, 랜선 단절(`iptables`), 손실·지연·순서 뒤바뀜·중복(`netem`) |
 | 명령 속도 제한 | `TokenBucket.*` (unit), `RobustnessIT.FloodIsLimitedToTheConfiguredRate`, `ThrottledClientKeepsReceivingEveryTrackFrame` 등 | 설정한 속도로 제한, 끊기거나 좀비로 오판되지 않음, 명령 유실·순서 변경 없음, 다른 클라이언트 영향 없음, **제한 중에도 트랙 프레임 손실 없음** |
 | 종료 | `RobustnessIT.StopUnderLoadNeverHangs` | 스트리밍 중, 긴 프레임 전송 중 `stop()` 12회 반복. 2초 안에 끝나고 모두 `BYE SHUTDOWN` 수신 |
@@ -274,4 +287,6 @@ magic u32 "RDR1" | frame_seq u32 | frag_index u16 | frag_count u16 | total_size 
   - 판정 기준을 "완성된 줄 수신"으로 바꿔도 첫 번째 경우만 막힌다. 악의적인 점유까지 막으려면 인증이나 "일정 시간 안에 `START`하지 않으면 종료" 같은 별도 정책이 필요하며, 과제 범위 밖으로 두었다.
 - 접속 수가 커지면 `poll()` → `epoll`로, 슬롯당 Sender 스레드 → 고정 크기 Sender 풀로 바꾸는 것이 맞다.
 - 인증/암호화 없음. UDP 목적지는 TCP 접속 IP로 고정해 반사 공격만 막았다.
+  - 형식이 맞는 위조 조각은 구별하지 못한다. 메모리나 크래시 문제는 없지만, 그런 패킷을 계속 받으면 진짜 프레임이 밀려나고 손실·지연 통계가 틀어질 수 있다. 막으려면 패킷 인증이 필요하다.
 - 테스트 환경 참고: GCC 11 TSan은 최신 WSL 커널에서 `setarch -R`이 필요하고, `pthread_cond_clockwait` 미지원으로 생기는 오탐 1종을 `tests/tsan.supp`에서 억제한다(data race 억제 아님).
+- 테스트 환경 참고: 측정 당시 WSL의 시스템 시계가 약 32초마다 2.8초씩 앞으로 튀었다. 지연 측정은 시스템 시계를 쓰므로 그 순간 전송 중이던 프레임의 지연이 크게 나온다. 서버의 주기와 타임아웃은 단조 시계를 써서 영향이 없다. `tests/fault_test.py`는 측정 중 시계가 튀면 다시 측정한다.

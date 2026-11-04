@@ -312,13 +312,22 @@ def test_impaired_network():
     check("5% loss: invalid data never accepted", r.get("invalid") == 0)
     check("5% loss: one connection throughout", r.get("sessions") == 1, f"sessions={r.get('sessions')}")
     pct = r.get("loss_pct", -1)
-    check("5% loss: frame loss near the expected 19%", 8 <= pct <= 30, f"{pct}%, expected {100 * (1 - survive):.0f}%")
+    # About 143 frames in 5 s: a single run can land far from the expected value (30.3% has been seen).
+    check("5% loss: frame loss near the expected 19%", 8 <= pct <= 35, f"{pct}%, expected {100 * (1 - survive):.0f}%")
     check("5% loss: received + lost covers the stream", abs(r.get("frames", 0) + r.get("lost", 0) - expected) < 12,
           f"{r.get('frames', 0) + r.get('lost', 0):.0f} of about {expected:.0f}")
     check("5% loss: lost frames show up as incomplete", abs(r.get("incomplete", -99) - r.get("lost", 0)) <= 3,
           f"incomplete={r.get('incomplete')} lost={r.get('lost')}")
 
-    r = stream_under("delay", "50ms")
+    # Latency compares wall clocks, and a frame in flight while the clock jumps measures the jump.
+    # WSL's clock has been seen jumping about 2.8 s every 32 s, so such a run says nothing.
+    for _ in range(4):
+        clock = time.time() - time.monotonic()
+        r = stream_under("delay", "50ms")
+        jump = time.time() - time.monotonic() - clock
+        if abs(jump) < 0.02:
+            break
+        print(f"     system clock jumped {jump:+.3f} s during the measurement, measuring again")
     # The average includes the few frames from before netem was added.
     check("50 ms delay: latency measured correctly", 45 <= r.get("latency_ms_avg", 0) <= 60 and r.get("latency_ms_max", 0) >= 49,
           f"avg {r.get('latency_ms_avg')} ms, max {r.get('latency_ms_max')} ms")

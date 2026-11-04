@@ -57,6 +57,27 @@ TEST(StreamStats, GapsCountAsLoss) {
     EXPECT_DOUBLE_EQ(s.loss_percent(), 50.0);
 }
 
+TEST(StreamStats, SequenceWraparoundIsNotReordering) {
+    StreamStats s;
+    s.on_frame(0xFFFFFFFEu, 0, 0);
+    s.on_frame(0xFFFFFFFFu, 0, 0);
+    s.on_frame(0, 0, 0);
+    s.on_frame(1, 0, 0);
+    EXPECT_EQ(s.lost(), 0u);
+    EXPECT_EQ(s.reordered(), 0u);
+
+    s.on_frame(0xFFFFFFFFu, 0, 0);  // late, from before the wrap
+    EXPECT_EQ(s.reordered(), 1u);
+}
+
+TEST(StreamStats, GapAcrossWraparoundCountsAsLoss) {
+    StreamStats s;
+    s.on_frame(0xFFFFFFFEu, 0, 0);
+    s.on_frame(1, 0, 0);  // FFFFFFFF and 0 are missing
+    EXPECT_EQ(s.lost(), 2u);
+    EXPECT_EQ(s.reordered(), 0u);
+}
+
 TEST(StreamStats, LateFrameIsNotLoss) {
     StreamStats s;
     s.on_frame(1, 0, 0);

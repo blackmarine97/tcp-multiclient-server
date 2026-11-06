@@ -1,5 +1,7 @@
 # TCP Multi-Client Server
 
+[![CI](https://github.com/blackmarine97/tcp-multiclient-server/actions/workflows/ci.yml/badge.svg)](https://github.com/blackmarine97/tcp-multiclient-server/actions/workflows/ci.yml)
+
 C++17 · POSIX sockets · Producer–Consumer · heartbeats and zombie handling
 
 A multi-client server that runs on a plain PC, without radar hardware. Up to 3 clients connect to a TCP
@@ -151,7 +153,7 @@ bash scripts/demo.sh build
 
 ```bash
 cd build
-ctest --output-on-failure          # everything (66 unit + 56 integration)
+ctest --output-on-failure          # everything (80 unit + 56 integration)
 ctest -L unit                       # unit tests only
 ctest -L integration                # integration tests only
 ./integration_tests --gtest_filter='*Kill*'   # a single test (prints its measurements)
@@ -165,6 +167,24 @@ Required tests from the assignment:
 | 4 concurrent connections → 4th rejected | `ServerIT.FourthConcurrentClientGetsErrFullAndIsClosed`, `ServerIT.FourSimultaneousConnectsExactlyOneRejected` |
 | 3 concurrent streams → fragments received per client | `ServerIT.ThreeClientsStreamConcurrently` |
 | Client killed with kill -9 → slot reclaimed | `ServerIT.KillDash9ClientReleasesSlotImmediately`, `ServerIT.KillDash9WhileFullLetsANewClientIn` |
+
+Every other requirement, where it is implemented and how it is checked:
+
+| Requirement | Implementation | Checked by |
+|---|---|---|
+| TCP command port, default 8088, set in a config file | `src/config.cpp`, [config/server.conf](config/server.conf) | `Config.*`, `tests/fault_test.py` (1) |
+| At most 3 clients, set in the config file | `max_clients`, `Server::handle_accept` | `ServerIT.FourthConcurrentClientGetsErrFullAndIsClosed`, `RobustnessIT.LargestAllowedSlotCountWorks` |
+| Welcome message on connect | `Server::handle_accept` (`WELCOME ...`) | Read first by every integration test and the smoke test |
+| `ERR FULL`, then close, when full | `Server::handle_accept` | `ServerIT.FourthConcurrentClientGetsErrFullAndIsClosed` |
+| Line-based commands ending in `\n` | `src/line_buffer.cpp`, `src/protocol.cpp`, `Server::handle_line` | `LineBuffer.*`, `Protocol.*`, `RobustnessIT.CommandSentOneByteAtATime`, `SeveralCommandsInOnePacketAnswerInOrder` |
+| Track data per client over UDP, fake frames every 35 ms | `Server::producer_loop`, `Server::sender_loop`, `src/track_frame.cpp` | `ServerIT.ThreeClientsStreamConcurrently`, `ServerIT.FramePeriodIsCloseToConfigured` |
+| Heartbeats | `Server::housekeeping` (`HB <seq>`) | `ServerIT.SilentClientIsZombieResponsiveClientIsNot` |
+| Zombie cleanup | `src/liveness.hpp`, `Server::housekeeping`, `Server::close_slot` | The zombie and kill -9 tests above |
+| Graceful shutdown | `sigwait` in `src/main.cpp`, `Server::stop` | `ServerIT.ServerShutdownSaysByeToEveryone`, smoke test (7) |
+| Producer–Consumer pattern | Producer thread → per-client queue → Sender thread | DESIGN.md §3 |
+| Bounded queue, overflow policy, drop count | `src/bounded_queue.hpp`, `queue_capacity`, `queue_overflow` | `BoundedQueue.*`, `ServerIT.StuckConsumerDrops*` |
+| Socket API chosen, with the reason | POSIX sockets + `poll()` | DESIGN.md §2 |
+| Design document: threads and queues, slot state diagram, zombie criteria | [docs/DESIGN.md](docs/DESIGN.md) | §3, §4, §5 |
 
 Beyond the assignment:
 
